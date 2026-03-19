@@ -1,7 +1,7 @@
 //----------------------------------------------------------------------------------
-//  PreviewExplorer - Phase 1-5 完全実装
-//  left pane: AviUtl2 preview embedding
-//  right pane: media explorer (2-tier tabs, file list, quick access)
+//  PreviewExplorer - IExplorerBrowser 実装
+//  left pane: AviUtl2 preview embedding (Phase 1)
+//  right pane: IExplorerBrowser + 2-tier tabs with right-click menus
 //----------------------------------------------------------------------------------
 #include <windows.h>
 #include <windowsx.h>
@@ -9,12 +9,17 @@
 #include <shlwapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
+#include <dwmapi.h>
 #include <string>
 #include <vector>
 #include <algorithm>
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 #include "plugin2.h"
 #include "logger2.h"
@@ -25,15 +30,6 @@
 //------------------------------------------------------------------------------
 struct SmallTab { std::wstring name, path; };
 struct BigTab   { std::wstring name; std::vector<SmallTab> smallTabs; int smallTabIdx = 0; };
-
-struct FileItem {
-    std::wstring name, fullPath, typeName;
-    bool     isDir      = false;
-    bool     supported  = true;
-    ULONGLONG size      = 0;
-    FILETIME  modified  = {};
-    int       iconIdx   = 0;
-};
 
 //------------------------------------------------------------------------------
 // グローバル
@@ -49,26 +45,15 @@ HWND g_hwndInfo     = nullptr;  // 左ペイン内テキスト（診断ログ表
 HWND g_hwndEmbedded = nullptr;  // 組み込み試行したプレビューウィンドウ
 
 // 右ペイン内コントロール
-HWND g_hwndBigTab    = nullptr;  // ID=101
-HWND g_hwndSmallTab  = nullptr;  // ID=102
-HWND g_hwndQAToggle  = nullptr;  // ID=103
-HWND g_hwndQAPanel   = nullptr;
-HWND g_hwndUpBtn     = nullptr;  // ID=104
-HWND g_hwndPathLabel = nullptr;  // ID=105
-HWND g_hwndListView  = nullptr;  // ID=106
+HWND g_hwndBigTab   = nullptr;  // ID=101
+HWND g_hwndSmallTab = nullptr;  // ID=102
+
+// IExplorerBrowser
+static IExplorerBrowser* g_peb = nullptr;
 
 // タブデータ
 std::vector<BigTab> g_bigTabs;
 int g_bigTabIdx = 0;
-
-// ファイルリスト
-std::vector<FileItem> g_fileItems;
-std::wstring          g_currentPath;
-bool                  g_qaVisible = true;
-
-// クイックアクセス
-struct QAItem { std::wstring path; HWND btn = nullptr; };
-std::vector<QAItem> g_qaItems;
 
 // スプリッタ
 constexpr int SPLITTER_W  = 5;
@@ -84,15 +69,20 @@ constexpr UINT_PTR TIMER_FIND_PREVIEW = 1;
 constexpr wchar_t WC_MAIN[]     = L"PreviewExplorer_Main";
 constexpr wchar_t WC_RIGHT[]    = L"PreviewExplorer_Right";
 constexpr wchar_t WC_SETTINGS[] = L"PreviewExplorer_Settings";
+constexpr wchar_t WC_INPUTDLG[] = L"PreviewExplorer_InputDlg";
 
 // レイアウト定数（右ペイン内）
-constexpr int BIG_TAB_H   = 26;
-constexpr int SMALL_TAB_H = 26;
-constexpr int QA_BTN_H    = 24;
-constexpr int QA_PANEL_H  = 60;  // 折り畳み時 0、展開時この値
-constexpr int NAV_H       = 26;
-constexpr int UP_BTN_W    = 60;
-constexpr int QA_BASE_ID  = 200;
+constexpr int BIG_TAB_H   = 36;
+constexpr int SMALL_TAB_H = 24;
+
+// フォント
+static HFONT g_hFontBig    = nullptr;
+static HFONT g_hFontNormal = nullptr;
+
+// テーマカラー (CONFIG_HANDLE から取得)
+static COLORREF g_clrBg   = RGB(0x30, 0x30, 0x30);  // デフォルト: ダークグレー
+static COLORREF g_clrText = RGB(0xFF, 0xFF, 0xFF);  // デフォルト: 白
+static HBRUSH   g_hBrushBg = nullptr;
 
 // 設定ウィンドウ用前方宣言
 static HWND g_hwndSettings = nullptr;
@@ -102,6 +92,59 @@ static HWND g_hwndSettings = nullptr;
 //------------------------------------------------------------------------------
 static void Log(const wchar_t* msg) {
     if (g_logger) g_logger->log(g_logger, msg);
+}
+
+//------------------------------------------------------------------------------
+// テーマ初期化 (InitializeConfig → RegisterPlugin の順で呼ばれるため
+//               RegisterPlugin 冒頭で一度だけ呼ぶ)
+//------------------------------------------------------------------------------
+static void InitTheme() {
+    // フォント情報 (style.conf [Font] の "Control" キー)
+    LPCWSTR fontName = L"Yu Gothic UI";
+    float   fontSize = 13.0f;
+    if (g_config) {
+        FONT_INFO* fi = g_config->get_font_info(g_config, "Control");
+        if (fi && fi->name && fi->name[0]) {
+            fontName = fi->name;
+            if (fi->size > 0.0f) fontSize = fi->size;
+        }
+    }
+    int logH = -MulDiv((int)fontSize, 96, 72);  // pt → logical units (96 DPI)
+
+    // 色情報 (style.conf [Color] の各キー)
+    // API は COLORREF (0x00BBGGRR) 形式で返す想定、0 は未取得
+    if (g_config) {
+        int raw = g_config->get_color_code(g_config, "Background");
+        if (raw) g_clrBg = (COLORREF)raw;
+        raw = g_config->get_color_code(g_config, "Text");
+        if (raw) g_clrText = (COLORREF)raw;
+    }
+
+    // ブラシ再作成
+    if (g_hBrushBg) { DeleteObject(g_hBrushBg); g_hBrushBg = nullptr; }
+    g_hBrushBg = CreateSolidBrush(g_clrBg);
+
+    // フォント再作成
+    if (g_hFontBig)    { DeleteObject(g_hFontBig);    g_hFontBig    = nullptr; }
+    if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = nullptr; }
+    g_hFontBig    = CreateFontW(logH - 1, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, fontName);
+    g_hFontNormal = CreateFontW(logH - 3, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, fontName);
+}
+
+// ダークテーマかどうか判定 (輝度 < 128 ならダーク)
+static bool IsDarkTheme() {
+    BYTE r = GetRValue(g_clrBg), g2 = GetGValue(g_clrBg), b = GetBValue(g_clrBg);
+    return (299 * r + 587 * g2 + 114 * b) / 1000 < 128;
+}
+
+// ウィンドウにダークモードを適用 (Windows 10 1809+)
+static void TrySetDarkMode(HWND hwnd) {
+    BOOL dark = IsDarkTheme() ? TRUE : FALSE;
+    DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
 }
 
 //------------------------------------------------------------------------------
@@ -124,215 +167,60 @@ static void SaveState();
 static void LoadState();
 
 //------------------------------------------------------------------------------
-// ファイルサイズ文字列
+// IExplorerBrowser ナビゲーション
 //------------------------------------------------------------------------------
-static std::wstring FormatSize(ULONGLONG sz) {
-    wchar_t buf[64];
-    if (sz < 1024ULL)            swprintf_s(buf, L"%llu B",        sz);
-    else if (sz < 1024ULL*1024)  swprintf_s(buf, L"%.1f KB",       sz / 1024.0);
-    else if (sz < 1024ULL*1024*1024) swprintf_s(buf, L"%.1f MB",  sz / (1024.0*1024));
-    else                         swprintf_s(buf, L"%.2f GB",       sz / (1024.0*1024*1024));
-    return buf;
-}
-
-//------------------------------------------------------------------------------
-// FILETIME -> 表示文字列
-//------------------------------------------------------------------------------
-static std::wstring FormatFileTime(const FILETIME& ft) {
-    FILETIME local{};
-    FileTimeToLocalFileTime(&ft, &local);
-    SYSTEMTIME st{};
-    FileTimeToSystemTime(&local, &st);
-    wchar_t buf[64];
-    swprintf_s(buf, L"%04d/%02d/%02d %02d:%02d",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
-    return buf;
-}
-
-//------------------------------------------------------------------------------
-// シェルシステムイメージリスト取得
-//------------------------------------------------------------------------------
-static HIMAGELIST g_sysImgList = nullptr;
-
-static void EnsureSysImageList() {
-    if (g_sysImgList) return;
-    SHFILEINFOW sfi{};
-    g_sysImgList = reinterpret_cast<HIMAGELIST>(
-        SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi),
-            SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
-}
-
-//------------------------------------------------------------------------------
-// is_support_media_file コールバック用パラメータ
-//------------------------------------------------------------------------------
-struct SupportCheckParam {
-    std::vector<FileItem>* items;
-    bool done = false;
-};
-
-static void SupportCheckCb(void* param, EDIT_SECTION* edit) {
-    auto* p = static_cast<SupportCheckParam*>(param);
-    for (auto& f : *p->items) {
-        if (!f.isDir) {
-            f.supported = edit->is_support_media_file(f.fullPath.c_str(), false);
-        }
-    }
-    p->done = true;
-}
-
-//------------------------------------------------------------------------------
-// QA ボタン再構築
-//------------------------------------------------------------------------------
-static void RebuildQAButtons() {
-    // 既存ボタン破棄
-    for (auto& qa : g_qaItems) {
-        if (qa.btn && IsWindow(qa.btn)) DestroyWindow(qa.btn);
-        qa.btn = nullptr;
-    }
-    if (!g_hwndQAPanel) return;
-
-    int x = 2, y = 2;
-    int btnW = 120, btnH = 22;
-    for (int i = 0; i < (int)g_qaItems.size(); i++) {
-        // パスからフォルダ名を取得
-        std::wstring label = g_qaItems[i].path;
-        auto pos = label.rfind(L'\\');
-        if (pos != std::wstring::npos && pos + 1 < label.size())
-            label = label.substr(pos + 1);
-        if (label.empty()) label = g_qaItems[i].path;
-
-        HWND btn = CreateWindowExW(0, L"BUTTON", label.c_str(),
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            x, y, btnW, btnH,
-            g_hwndQAPanel,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(QA_BASE_ID + i)),
-            GetModuleHandleW(nullptr), nullptr);
-        g_qaItems[i].btn = btn;
-        x += btnW + 4;
-        if (x + btnW > 500) { x = 2; y += btnH + 2; }
-    }
-}
-
-//------------------------------------------------------------------------------
-// ファイルリスト構築
-//------------------------------------------------------------------------------
-static void PopulateFileList(const std::wstring& path) {
-    g_fileItems.clear();
-    if (g_hwndListView) ListView_DeleteAllItems(g_hwndListView);
-
-    if (path.empty()) {
-        SetWindowTextW(g_hwndPathLabel, L"");
-        return;
-    }
-
-    SetWindowTextW(g_hwndPathLabel, path.c_str());
-    g_currentPath = path;
-
-    std::wstring pattern = path;
-    if (!pattern.empty() && pattern.back() != L'\\') pattern += L'\\';
-    pattern += L'*';
-
-    std::vector<FileItem> dirs, files;
-
-    WIN32_FIND_DATAW fd{};
-    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) goto done;
-
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        FileItem fi;
-        fi.name = fd.cFileName;
-        fi.fullPath = path + (path.back() == L'\\' ? L"" : L"\\") + fd.cFileName;
-        fi.isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        fi.size  = fi.isDir ? 0 : ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-        fi.modified = fd.ftLastWriteTime;
-
-        // アイコン & 種類名
-        SHFILEINFOW sfi{};
-        SHGetFileInfoW(fi.fullPath.c_str(), 0, &sfi, sizeof(sfi),
-            SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_TYPENAME);
-        fi.iconIdx  = sfi.iIcon;
-        fi.typeName = sfi.szTypeName;
-
-        if (fi.isDir) dirs.push_back(std::move(fi));
-        else          files.push_back(std::move(fi));
-    } while (FindNextFileW(hFind, &fd));
-    FindClose(hFind);
-
-    // 名前順ソート
-    auto byName = [](const FileItem& a, const FileItem& b) {
-        return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
-    };
-    std::sort(dirs.begin(),  dirs.end(),  byName);
-    std::sort(files.begin(), files.end(), byName);
-
-    for (auto& d : dirs)   g_fileItems.push_back(std::move(d));
-    for (auto& f : files)  g_fileItems.push_back(std::move(f));
-
-done:
-    // サポートチェック
-    if (g_editHandle) {
-        SupportCheckParam scp{ &g_fileItems };
-        g_editHandle->call_edit_section_param(&scp, SupportCheckCb);
-        // 失敗 (プロジェクトなし) の場合 done==false のまま → supported=true のまま
-    }
-
-    // リストビューへ追加
-    if (!g_hwndListView) return;
-    EnsureSysImageList();
-
-    for (int i = 0; i < (int)g_fileItems.size(); i++) {
-        const auto& fi = g_fileItems[i];
-        LVITEMW lvi{};
-        lvi.mask    = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
-        lvi.iItem   = i;
-        lvi.iSubItem = 0;
-        lvi.pszText = const_cast<wchar_t*>(fi.name.c_str());
-        lvi.iImage  = fi.iconIdx;
-        lvi.lParam  = static_cast<LPARAM>(i);
-        ListView_InsertItem(g_hwndListView, &lvi);
-
-        // 種類
-        ListView_SetItemText(g_hwndListView, i, 1,
-            const_cast<wchar_t*>(fi.typeName.c_str()));
-        // サイズ
-        std::wstring szStr = fi.isDir ? L"" : FormatSize(fi.size);
-        ListView_SetItemText(g_hwndListView, i, 2,
-            const_cast<wchar_t*>(szStr.c_str()));
-        // 更新日時
-        std::wstring dtStr = FormatFileTime(fi.modified);
-        ListView_SetItemText(g_hwndListView, i, 3,
-            const_cast<wchar_t*>(dtStr.c_str()));
-    }
-}
-
-//------------------------------------------------------------------------------
-// 親フォルダへ移動
-//------------------------------------------------------------------------------
-static void NavigateUp() {
-    if (g_currentPath.empty()) return;
-    std::wstring parent = g_currentPath;
-    // 末尾の \\ を除去
-    while (!parent.empty() && parent.back() == L'\\') parent.pop_back();
-    auto pos = parent.rfind(L'\\');
-    if (pos == std::wstring::npos) {
-        // ドライブルートの場合は移動しない
-        return;
-    }
-    std::wstring up = parent.substr(0, pos);
-    if (up.size() == 2 && up[1] == L':') up += L'\\';  // "C:" -> "C:\"
-    PopulateFileList(up);
-}
-
-//------------------------------------------------------------------------------
-// 現在のスモールタブのパスに移動
-//------------------------------------------------------------------------------
-static void NavigateToCurrentTab() {
+static void NavigateExplorerToCurrentTab() {
+    if (!g_peb) return;
     if (g_bigTabIdx < 0 || g_bigTabIdx >= (int)g_bigTabs.size()) return;
     auto& bt = g_bigTabs[g_bigTabIdx];
     if (bt.smallTabIdx < 0 || bt.smallTabIdx >= (int)bt.smallTabs.size()) return;
     const std::wstring& path = bt.smallTabs[bt.smallTabIdx].path;
-    PopulateFileList(path);
+
+    if (path.empty() || path == L"QuickAccess") {
+        // Windows クイックアクセスへ移動
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        // FOLDERID_QuickAccess (Windows 10+) を手動定義
+        const GUID FOLDERID_QA = {0x679f85cb, 0x0220, 0x4080,
+            {0xb2, 0x9b, 0x55, 0x40, 0xcc, 0x05, 0xaa, 0xb6}};
+        if (SUCCEEDED(SHGetKnownFolderIDList(FOLDERID_QA, 0, nullptr, &pidl))) {
+            g_peb->BrowseToIDList(pidl, SBSP_ABSOLUTE);
+            CoTaskMemFree(pidl);
+        }
+    } else {
+        IShellItem* psi = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&psi)))) {
+            g_peb->BrowseToObject(psi, SBSP_ABSOLUTE);
+            psi->Release();
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// 現在の IExplorerBrowser の場所をパス文字列として取得
+//------------------------------------------------------------------------------
+static std::wstring GetCurrentExplorerPath() {
+    if (!g_peb) return L"";
+    std::wstring result;
+    IShellView* psv = nullptr;
+    if (SUCCEEDED(g_peb->GetCurrentView(IID_PPV_ARGS(&psv)))) {
+        IFolderView2* pfv2 = nullptr;
+        if (SUCCEEDED(psv->QueryInterface(IID_PPV_ARGS(&pfv2)))) {
+            IPersistFolder2* ppf2 = nullptr;
+            if (SUCCEEDED(pfv2->GetFolder(IID_PPV_ARGS(&ppf2)))) {
+                PIDLIST_ABSOLUTE pidl = nullptr;
+                if (SUCCEEDED(ppf2->GetCurFolder(&pidl))) {
+                    wchar_t path[MAX_PATH]{};
+                    SHGetPathFromIDListW(pidl, path);
+                    result = path;
+                    CoTaskMemFree(pidl);
+                }
+                ppf2->Release();
+            }
+            pfv2->Release();
+        }
+        psv->Release();
+    }
+    return result;
 }
 
 //------------------------------------------------------------------------------
@@ -362,7 +250,7 @@ static void RebuildSmallTabs() {
 static void DoRightLayout(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
-    int W = rc.right;
+    int W = rc.right, H = rc.bottom;
     int y = 0;
 
     if (g_hwndBigTab) {
@@ -373,119 +261,291 @@ static void DoRightLayout(HWND hwnd) {
         SetWindowPos(g_hwndSmallTab, nullptr, 0, y, W, SMALL_TAB_H, SWP_NOZORDER | SWP_NOACTIVATE);
         y += SMALL_TAB_H;
     }
-    if (g_hwndQAToggle) {
-        SetWindowPos(g_hwndQAToggle, nullptr, 0, y, W, QA_BTN_H, SWP_NOZORDER | SWP_NOACTIVATE);
-        y += QA_BTN_H;
-    }
-    if (g_hwndQAPanel) {
-        int panelH = g_qaVisible ? QA_PANEL_H : 0;
-        SetWindowPos(g_hwndQAPanel, nullptr, 0, y, W, panelH, SWP_NOZORDER | SWP_NOACTIVATE);
-        ShowWindow(g_hwndQAPanel, g_qaVisible ? SW_SHOW : SW_HIDE);
-        y += panelH;
-    }
-    // Navigation bar
-    if (g_hwndUpBtn) {
-        SetWindowPos(g_hwndUpBtn, nullptr, 0, y, UP_BTN_W, NAV_H, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    if (g_hwndPathLabel) {
-        SetWindowPos(g_hwndPathLabel, nullptr, UP_BTN_W, y, W - UP_BTN_W, NAV_H, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    y += NAV_H;
-    // ListView fills the rest
-    if (g_hwndListView) {
-        int lvH = rc.bottom - y;
-        if (lvH < 0) lvH = 0;
-        SetWindowPos(g_hwndListView, nullptr, 0, y, W, lvH, SWP_NOZORDER | SWP_NOACTIVATE);
-        // 名前列を残りいっぱいに
-        RECT lrc;
-        GetClientRect(g_hwndListView, &lrc);
-        int nameW = lrc.right - 90 - 80 - 130;
-        if (nameW < 50) nameW = 50;
-        ListView_SetColumnWidth(g_hwndListView, 0, nameW);
+
+    if (g_peb) {
+        RECT ebRect = {0, y, W, H};
+        g_peb->SetRect(nullptr, ebRect);
     }
 }
 
-//------------------------------------------------------------------------------
-// ファイルリスト右クリック処理
-//------------------------------------------------------------------------------
-static void OnListViewRightClick(HWND hwnd, int iItem) {
-    if (iItem < 0 || iItem >= (int)g_fileItems.size()) return;
-    const FileItem& fi = g_fileItems[iItem];
-    if (!fi.isDir) return;
-
-    HMENU hm = CreatePopupMenu();
-    AppendMenuW(hm, MF_STRING, 1, L"クイックアクセスに追加");
-    POINT pt;
-    GetCursorPos(&pt);
-    int cmd = TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-    DestroyMenu(hm);
-
-    if (cmd == 1) {
-        // 重複チェック
-        for (auto& qa : g_qaItems) {
-            if (_wcsicmp(qa.path.c_str(), fi.fullPath.c_str()) == 0) return;
-        }
-        QAItem qa;
-        qa.path = fi.fullPath;
-        g_qaItems.push_back(qa);
-        RebuildQAButtons();
-        SaveState();
-    }
-}
-
-//------------------------------------------------------------------------------
-// QAボタン右クリック処理
-//------------------------------------------------------------------------------
-static void OnQAButtonRightClick(int qaIdx) {
-    HMENU hm = CreatePopupMenu();
-    AppendMenuW(hm, MF_STRING, 1, L"削除");
-    POINT pt;
-    GetCursorPos(&pt);
-    int cmd = TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0,
-        g_hwndQAPanel, nullptr);
-    DestroyMenu(hm);
-
-    if (cmd == 1 && qaIdx >= 0 && qaIdx < (int)g_qaItems.size()) {
-        if (g_qaItems[qaIdx].btn && IsWindow(g_qaItems[qaIdx].btn))
-            DestroyWindow(g_qaItems[qaIdx].btn);
-        g_qaItems.erase(g_qaItems.begin() + qaIdx);
-        RebuildQAButtons();
-        SaveState();
-    }
-}
-
-//------------------------------------------------------------------------------
-// ListView ダブルクリック処理
-//------------------------------------------------------------------------------
-struct PlaceFileParam {
-    std::wstring path;
-    bool done = false;
+//==============================================================================
+// 入力ダイアログ（インライン実装）
+//==============================================================================
+struct InputDlgData {
+    const wchar_t* title;
+    const wchar_t* prompt;
+    std::wstring   initial;
+    std::wstring   result;
+    bool           ok = false;
+    HWND           hwndEdit   = nullptr;
+    HWND           hwndOK     = nullptr;
+    HWND           hwndCancel = nullptr;
 };
-static void PlaceFileCb(void* param, EDIT_SECTION* edit) {
-    auto* p = static_cast<PlaceFileParam*>(param);
-    edit->create_object_from_media_file(p->path.c_str(),
-        edit->info->layer, edit->info->frame, 0);
-    p->done = true;
+
+static LRESULT CALLBACK InputDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+        auto* d  = reinterpret_cast<InputDlgData*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(d));
+
+        HINSTANCE hi = GetModuleHandleW(nullptr);
+        // プロンプト
+        CreateWindowExW(0, L"STATIC", d->prompt,
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            8, 8, 280, 20, hwnd, nullptr, hi, nullptr);
+        // エディット
+        d->hwndEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", d->initial.c_str(),
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            8, 32, 280, 22, hwnd, reinterpret_cast<HMENU>(1), hi, nullptr);
+        // OK / Cancel
+        d->hwndOK = CreateWindowExW(0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            66, 62, 70, 24, hwnd, reinterpret_cast<HMENU>(IDOK), hi, nullptr);
+        d->hwndCancel = CreateWindowExW(0, L"BUTTON", L"キャンセル",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            148, 62, 80, 24, hwnd, reinterpret_cast<HMENU>(IDCANCEL), hi, nullptr);
+
+        SendMessageW(d->hwndEdit, EM_SETSEL, 0, -1);
+        SetFocus(d->hwndEdit);
+        return 0;
+    }
+    case WM_COMMAND: {
+        auto* d = reinterpret_cast<InputDlgData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (!d) break;
+        int id = LOWORD(wp);
+        if (id == IDOK) {
+            wchar_t buf[512]{};
+            GetWindowTextW(d->hwndEdit, buf, 512);
+            d->result = buf;
+            d->ok = true;
+            DestroyWindow(hwnd);
+        } else if (id == IDCANCEL) {
+            d->ok = false;
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) {
+            auto* d = reinterpret_cast<InputDlgData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (d) { d->ok = false; }
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void OnListViewDblClick(int iItem) {
-    if (iItem < 0 || iItem >= (int)g_fileItems.size()) return;
-    const FileItem& fi = g_fileItems[iItem];
-    if (fi.isDir) {
-        PopulateFileList(fi.fullPath);
-    } else {
-        if (g_editHandle) {
-            PlaceFileParam pfp;
-            pfp.path = fi.fullPath;
-            g_editHandle->call_edit_section_param(&pfp, PlaceFileCb);
+static bool ShowInputDialog(HWND parent, const wchar_t* title,
+                            const wchar_t* prompt, std::wstring& result) {
+    InputDlgData d;
+    d.title   = title;
+    d.prompt  = prompt;
+    d.initial = result;
+
+    HWND hdlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        WC_INPUTDLG, title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 310, 102,
+        parent, nullptr, GetModuleHandleW(nullptr), &d);
+
+    if (!hdlg) return false;
+
+    // ローカルメッセージループ
+    MSG m{};
+    while (IsWindow(hdlg) && GetMessageW(&m, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(hdlg, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
         }
     }
+
+    if (d.ok) {
+        result = d.result;
+        return true;
+    }
+    return false;
+}
+
+//==============================================================================
+// ビッグタブ右クリック サブクラスプロシージャ
+//==============================================================================
+static LRESULT CALLBACK BigTabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                           UINT_PTR, DWORD_PTR) {
+    if (msg == WM_RBUTTONDOWN) {
+        TCHITTESTINFO hti{};
+        hti.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int hitIdx = TabCtrl_HitTest(hwnd, &hti);
+
+        HMENU hm = CreatePopupMenu();
+        AppendMenuW(hm, MF_STRING, 3001, L"追加");
+        if (hitIdx >= 0) {
+            AppendMenuW(hm, MF_STRING, 3002, L"名前変更");
+            AppendMenuW(hm, MF_STRING, 3003, L"削除");
+        }
+        POINT pt; GetCursorPos(&pt);
+        int cmd = TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                 pt.x, pt.y, 0, hwnd, nullptr);
+        DestroyMenu(hm);
+
+        if (cmd == 3001) {
+            // 追加
+            BigTab bt;
+            bt.name = L"新規";
+            SmallTab st; st.name = L"クイックアクセス"; st.path = L"";
+            bt.smallTabs.push_back(st);
+            g_bigTabs.push_back(bt);
+            g_bigTabIdx = (int)g_bigTabs.size() - 1;
+
+            TCITEMW tci{};
+            tci.mask    = TCIF_TEXT;
+            tci.pszText = const_cast<wchar_t*>(g_bigTabs[g_bigTabIdx].name.c_str());
+            TabCtrl_InsertItem(hwnd, g_bigTabIdx, &tci);
+            TabCtrl_SetCurSel(hwnd, g_bigTabIdx);
+            RebuildSmallTabs();
+            NavigateExplorerToCurrentTab();
+            SaveState();
+
+        } else if (cmd == 3002 && hitIdx >= 0) {
+            // 名前変更
+            std::wstring name = g_bigTabs[hitIdx].name;
+            if (ShowInputDialog(GetParent(hwnd), L"名前変更", L"新しい名前:", name)) {
+                g_bigTabs[hitIdx].name = name;
+                TCITEMW tci{};
+                tci.mask    = TCIF_TEXT;
+                tci.pszText = const_cast<wchar_t*>(name.c_str());
+                TabCtrl_SetItem(hwnd, hitIdx, &tci);
+                SaveState();
+            }
+
+        } else if (cmd == 3003 && hitIdx >= 0) {
+            // 削除
+            if (g_bigTabs.size() <= 1) {
+                MessageBoxW(hwnd, L"最後のタブは削除できません。", L"削除", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            g_bigTabs.erase(g_bigTabs.begin() + hitIdx);
+            TabCtrl_DeleteItem(hwnd, hitIdx);
+            if (g_bigTabIdx >= (int)g_bigTabs.size())
+                g_bigTabIdx = (int)g_bigTabs.size() - 1;
+            TabCtrl_SetCurSel(hwnd, g_bigTabIdx);
+            RebuildSmallTabs();
+            NavigateExplorerToCurrentTab();
+            SaveState();
+        }
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+//==============================================================================
+// スモールタブ右クリック サブクラスプロシージャ
+//==============================================================================
+static LRESULT CALLBACK SmallTabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                             UINT_PTR, DWORD_PTR) {
+    if (msg == WM_RBUTTONDOWN) {
+        TCHITTESTINFO hti{};
+        hti.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int hitIdx = TabCtrl_HitTest(hwnd, &hti);
+
+        if (g_bigTabIdx < 0 || g_bigTabIdx >= (int)g_bigTabs.size()) return 0;
+        auto& bt = g_bigTabs[g_bigTabIdx];
+
+        HMENU hm = CreatePopupMenu();
+        AppendMenuW(hm, MF_STRING, 4001, L"追加");
+        if (hitIdx >= 0) {
+            AppendMenuW(hm, MF_STRING, 4002, L"名前変更");
+            AppendMenuW(hm, MF_STRING, 4003, L"パス変更...");
+            AppendMenuW(hm, MF_STRING, 4004, L"現在の場所をパスに設定");
+            AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hm, MF_STRING, 4005, L"削除");
+        }
+        POINT pt; GetCursorPos(&pt);
+        int cmd = TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                 pt.x, pt.y, 0, hwnd, nullptr);
+        DestroyMenu(hm);
+
+        if (cmd == 4001) {
+            // 追加
+            SmallTab st; st.name = L"新規"; st.path = L"";
+            bt.smallTabs.push_back(st);
+            int newIdx = (int)bt.smallTabs.size() - 1;
+            TCITEMW tci{};
+            tci.mask    = TCIF_TEXT;
+            tci.pszText = const_cast<wchar_t*>(st.name.c_str());
+            TabCtrl_InsertItem(hwnd, newIdx, &tci);
+            bt.smallTabIdx = newIdx;
+            TabCtrl_SetCurSel(hwnd, newIdx);
+            NavigateExplorerToCurrentTab();
+            SaveState();
+
+        } else if (cmd == 4002 && hitIdx >= 0) {
+            // 名前変更
+            std::wstring name = bt.smallTabs[hitIdx].name;
+            if (ShowInputDialog(GetParent(hwnd), L"名前変更", L"新しい名前:", name)) {
+                bt.smallTabs[hitIdx].name = name;
+                TCITEMW tci{};
+                tci.mask    = TCIF_TEXT;
+                tci.pszText = const_cast<wchar_t*>(name.c_str());
+                TabCtrl_SetItem(hwnd, hitIdx, &tci);
+                SaveState();
+            }
+
+        } else if (cmd == 4003 && hitIdx >= 0) {
+            // パス変更（SHBrowseForFolder）
+            wchar_t disp[MAX_PATH]{};
+            BROWSEINFOW bi{};
+            bi.hwndOwner = GetParent(hwnd);
+            bi.pszDisplayName = disp;
+            bi.lpszTitle = L"フォルダを選択";
+            bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+            if (pidl) {
+                wchar_t path[MAX_PATH]{};
+                SHGetPathFromIDListW(pidl, path);
+                CoTaskMemFree(pidl);
+                bt.smallTabs[hitIdx].path = path;
+                // 現在のタブなら移動
+                if (hitIdx == bt.smallTabIdx)
+                    NavigateExplorerToCurrentTab();
+                SaveState();
+            }
+
+        } else if (cmd == 4004 && hitIdx >= 0) {
+            // 現在の IExplorerBrowser の場所をパスに設定
+            std::wstring path = GetCurrentExplorerPath();
+            if (!path.empty()) {
+                bt.smallTabs[hitIdx].path = path;
+                SaveState();
+            }
+
+        } else if (cmd == 4005 && hitIdx >= 0) {
+            // 削除
+            if (bt.smallTabs.size() <= 1) {
+                MessageBoxW(hwnd, L"最後のタブは削除できません。", L"削除", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            bt.smallTabs.erase(bt.smallTabs.begin() + hitIdx);
+            TabCtrl_DeleteItem(hwnd, hitIdx);
+            if (bt.smallTabIdx >= (int)bt.smallTabs.size())
+                bt.smallTabIdx = (int)bt.smallTabs.size() - 1;
+            TabCtrl_SetCurSel(hwnd, bt.smallTabIdx);
+            NavigateExplorerToCurrentTab();
+            SaveState();
+        }
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
 //==============================================================================
 // 設定ウィンドウ
 //==============================================================================
-// 設定ウィンドウ内コントロール
 struct SettingsControls {
     HWND listBig       = nullptr;
     HWND editBigName   = nullptr;
@@ -507,9 +567,8 @@ struct SettingsControls {
 };
 static SettingsControls g_sc{};
 
-// 設定ウィンドウ用ローカルデータ（開いている間のコピー）
 static std::vector<BigTab> g_settingsTabs;
-static int g_settBigIdx   = -1;
+static int g_settBigIdx = -1;
 
 static void SettingsRefreshBigList() {
     SendMessageW(g_sc.listBig, LB_RESETCONTENT, 0, 0);
@@ -533,7 +592,6 @@ static void SettingsApplyToMain() {
         g_bigTabIdx = (int)g_bigTabs.size() - 1;
     if (g_bigTabIdx < 0) g_bigTabIdx = 0;
 
-    // ビッグタブを再構築
     if (g_hwndBigTab) {
         TabCtrl_DeleteAllItems(g_hwndBigTab);
         for (int i = 0; i < (int)g_bigTabs.size(); i++) {
@@ -546,7 +604,7 @@ static void SettingsApplyToMain() {
             TabCtrl_SetCurSel(g_hwndBigTab, g_bigTabIdx);
     }
     RebuildSmallTabs();
-    NavigateToCurrentTab();
+    NavigateExplorerToCurrentTab();
     SaveState();
 }
 
@@ -560,7 +618,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         int x1 = 4, x2 = W / 2 + 4;
         int y = 4;
 
-        // --- Big tab 側 ---
         CreateWindowExW(0, L"STATIC", L"大カテゴリ",
             WS_CHILD | WS_VISIBLE, x1, y, half, 16,
             hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -570,7 +627,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             x1, y, half, 140,
             hwnd, reinterpret_cast<HMENU>(1001), GetModuleHandleW(nullptr), nullptr);
         y += 144;
-        // ボタン行
         g_sc.btnBigAdd  = CreateWindowExW(0, L"BUTTON", L"追加",  WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, x1,      y, 40, 22, hwnd, reinterpret_cast<HMENU>(1010), GetModuleHandleW(nullptr), nullptr);
         g_sc.btnBigDel  = CreateWindowExW(0, L"BUTTON", L"削除",  WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, x1+44,  y, 40, 22, hwnd, reinterpret_cast<HMENU>(1011), GetModuleHandleW(nullptr), nullptr);
         g_sc.btnBigUp   = CreateWindowExW(0, L"BUTTON", L"↑",    WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, x1+88,  y, 30, 22, hwnd, reinterpret_cast<HMENU>(1012), GetModuleHandleW(nullptr), nullptr);
@@ -584,7 +640,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         g_sc.btnBigSave = CreateWindowExW(0, L"BUTTON", L"保存",  WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
             x1+half-46, y, 46, 22, hwnd, reinterpret_cast<HMENU>(1021), GetModuleHandleW(nullptr), nullptr);
 
-        // --- Small tab 側 ---
         y = 4;
         CreateWindowExW(0, L"STATIC", L"小カテゴリ",
             WS_CHILD|WS_VISIBLE, x2, y, half, 16,
@@ -616,11 +671,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         g_sc.btnSmallBrowse = CreateWindowExW(0, L"BUTTON", L"参照...", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
             x2+half-52, y, 52, 22, hwnd, reinterpret_cast<HMENU>(2031), GetModuleHandleW(nullptr), nullptr);
 
-        // 閉じるボタン
         g_sc.btnClose = CreateWindowExW(0, L"BUTTON", L"閉じる", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
             W-80, H-30, 76, 26, hwnd, reinterpret_cast<HMENU>(9999), GetModuleHandleW(nullptr), nullptr);
 
-        // 初期データ
         g_settingsTabs = g_bigTabs;
         g_settBigIdx   = g_bigTabIdx;
         SettingsRefreshBigList();
@@ -631,19 +684,18 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     case WM_COMMAND: {
         int id = LOWORD(wp);
         switch (id) {
-        case 1001: // Big listbox 選択変更
+        case 1001:
             if (HIWORD(wp) == LBN_SELCHANGE) {
                 int sel = (int)SendMessageW(g_sc.listBig, LB_GETCURSEL, 0, 0);
                 if (sel != LB_ERR) {
                     g_settBigIdx = sel;
                     SettingsRefreshSmallList();
-                    // 名前エディットに反映
                     if (g_settBigIdx < (int)g_settingsTabs.size())
                         SetWindowTextW(g_sc.editBigName, g_settingsTabs[g_settBigIdx].name.c_str());
                 }
             }
             break;
-        case 2001: // Small listbox 選択変更
+        case 2001:
             if (HIWORD(wp) == LBN_SELCHANGE) {
                 if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size()) {
                     auto& bt = g_settingsTabs[g_settBigIdx];
@@ -655,18 +707,17 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 }
             }
             break;
-
-        // Big tab 操作
-        case 1010: { // 追加
-            BigTab bt;
-            bt.name = L"新規";
+        case 1010: {
+            BigTab bt; bt.name = L"新規";
+            SmallTab st; st.name = L"クイックアクセス"; st.path = L"";
+            bt.smallTabs.push_back(st);
             g_settingsTabs.push_back(bt);
             g_settBigIdx = (int)g_settingsTabs.size() - 1;
             SettingsRefreshBigList();
             SettingsRefreshSmallList();
             break;
         }
-        case 1011: { // 削除
+        case 1011: {
             if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size()) {
                 g_settingsTabs.erase(g_settingsTabs.begin() + g_settBigIdx);
                 if (g_settBigIdx >= (int)g_settingsTabs.size()) g_settBigIdx--;
@@ -675,7 +726,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-        case 1012: { // 上へ
+        case 1012: {
             if (g_settBigIdx > 0) {
                 std::swap(g_settingsTabs[g_settBigIdx], g_settingsTabs[g_settBigIdx - 1]);
                 g_settBigIdx--;
@@ -683,7 +734,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-        case 1013: { // 下へ
+        case 1013: {
             if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size() - 1) {
                 std::swap(g_settingsTabs[g_settBigIdx], g_settingsTabs[g_settBigIdx + 1]);
                 g_settBigIdx++;
@@ -691,7 +742,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-        case 1021: { // Big 名前保存
+        case 1021: {
             if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size()) {
                 wchar_t buf[256]{};
                 GetWindowTextW(g_sc.editBigName, buf, 256);
@@ -700,9 +751,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-
-        // Small tab 操作
-        case 2010: { // 追加
+        case 2010: {
             if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size()) {
                 SmallTab st; st.name = L"新規"; st.path = L"";
                 g_settingsTabs[g_settBigIdx].smallTabs.push_back(st);
@@ -710,7 +759,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-        case 2011: { // 削除
+        case 2011: {
             if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size()) {
                 auto& bt = g_settingsTabs[g_settBigIdx];
                 int sel = (int)SendMessageW(g_sc.listSmall, LB_GETCURSEL, 0, 0);
@@ -721,7 +770,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-        case 2012: { // Small 上へ
+        case 2012: {
             if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size()) {
                 auto& bt = g_settingsTabs[g_settBigIdx];
                 int sel = (int)SendMessageW(g_sc.listSmall, LB_GETCURSEL, 0, 0);
@@ -733,7 +782,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-        case 2013: { // Small 下へ
+        case 2013: {
             if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size()) {
                 auto& bt = g_settingsTabs[g_settBigIdx];
                 int sel = (int)SendMessageW(g_sc.listSmall, LB_GETCURSEL, 0, 0);
@@ -745,7 +794,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-        case 2021: { // Small 名前+パス保存
+        case 2021: {
             if (g_settBigIdx >= 0 && g_settBigIdx < (int)g_settingsTabs.size()) {
                 auto& bt = g_settingsTabs[g_settBigIdx];
                 int sel = (int)SendMessageW(g_sc.listSmall, LB_GETCURSEL, 0, 0);
@@ -760,8 +809,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-        case 2031: { // 参照...
-            // BrowseForFolder
+        case 2031: {
             wchar_t buf[MAX_PATH]{};
             BROWSEINFOW bi{};
             bi.hwndOwner = hwnd;
@@ -777,9 +825,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             }
             break;
         }
-
-        case 9999: // 閉じる
-            // 設定を反映
+        case 9999:
             SettingsApplyToMain();
             DestroyWindow(hwnd);
             g_hwndSettings = nullptr;
@@ -811,33 +857,6 @@ static void OpenSettingsCallback(HWND hwndParent, HINSTANCE /*dll_hinst*/) {
 }
 
 //==============================================================================
-// QA パネル プロシージャ
-//==============================================================================
-static LRESULT CALLBACK QAPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_COMMAND: {
-        int id = LOWORD(wp);
-        if (id >= QA_BASE_ID && id < QA_BASE_ID + (int)g_qaItems.size()) {
-            int idx = id - QA_BASE_ID;
-            PopulateFileList(g_qaItems[idx].path);
-        }
-        return 0;
-    }
-    case WM_CONTEXTMENU: {
-        HWND hBtn = reinterpret_cast<HWND>(wp);
-        for (int i = 0; i < (int)g_qaItems.size(); i++) {
-            if (g_qaItems[i].btn == hBtn) {
-                OnQAButtonRightClick(i);
-                break;
-            }
-        }
-        return 0;
-    }
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-//==============================================================================
 // 右ペイン プロシージャ
 //==============================================================================
 static LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -845,72 +864,25 @@ static LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_CREATE: {
         HINSTANCE hi = GetModuleHandleW(nullptr);
 
-        // Big tab
+        // ビッグタブ（太字フォント・高さ36px）
         g_hwndBigTab = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
-            WS_CHILD | WS_VISIBLE | TCS_FIXEDWIDTH,
+            WS_CHILD | WS_VISIBLE | TCS_HOTTRACK,
             0, 0, 400, BIG_TAB_H,
             hwnd, reinterpret_cast<HMENU>(101), hi, nullptr);
+        if (g_hFontBig)
+            SendMessageW(g_hwndBigTab, WM_SETFONT, (WPARAM)g_hFontBig, TRUE);
 
-        // Small tab
+        // スモールタブ（通常フォント・高さ24px）
         g_hwndSmallTab = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
-            WS_CHILD | WS_VISIBLE | TCS_FIXEDWIDTH,
+            WS_CHILD | WS_VISIBLE,
             0, BIG_TAB_H, 400, SMALL_TAB_H,
             hwnd, reinterpret_cast<HMENU>(102), hi, nullptr);
+        if (g_hFontNormal)
+            SendMessageW(g_hwndSmallTab, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
-        // QA トグルボタン
-        g_hwndQAToggle = CreateWindowExW(0, L"BUTTON",
-            g_qaVisible ? L"▲ クイックアクセス" : L"▼ クイックアクセス",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0, BIG_TAB_H + SMALL_TAB_H, 400, QA_BTN_H,
-            hwnd, reinterpret_cast<HMENU>(103), hi, nullptr);
-
-        // QA パネル (子ウィンドウ。QAPanelProc 使用)
-        g_hwndQAPanel = CreateWindowExW(0, L"PreviewExplorer_QAPanel", nullptr,
-            WS_CHILD | (g_qaVisible ? WS_VISIBLE : 0),
-            0, BIG_TAB_H + SMALL_TAB_H + QA_BTN_H, 400, QA_PANEL_H,
-            hwnd, nullptr, hi, nullptr);
-
-        // ↑ 上へボタン
-        g_hwndUpBtn = CreateWindowExW(0, L"BUTTON", L"↑ 上へ",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            0, 0, UP_BTN_W, NAV_H,
-            hwnd, reinterpret_cast<HMENU>(104), hi, nullptr);
-
-        // パスラベル
-        g_hwndPathLabel = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_NOPREFIX,
-            UP_BTN_W, 0, 300, NAV_H,
-            hwnd, reinterpret_cast<HMENU>(105), hi, nullptr);
-
-        // ListView
-        g_hwndListView = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
-            0, 0, 400, 300,
-            hwnd, reinterpret_cast<HMENU>(106), hi, nullptr);
-
-        // ListView 拡張スタイル
-        ListView_SetExtendedListViewStyle(g_hwndListView,
-            LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-
-        // システムイメージリストをセット
-        EnsureSysImageList();
-        if (g_sysImgList)
-            ListView_SetImageList(g_hwndListView, g_sysImgList, LVSIL_SMALL);
-
-        // 列追加
-        LVCOLUMNW col{};
-        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
-        col.fmt  = LVCFMT_LEFT;
-        col.cx   = 200; col.pszText = const_cast<wchar_t*>(L"名前");
-        ListView_InsertColumn(g_hwndListView, 0, &col);
-        col.cx   = 90;  col.pszText = const_cast<wchar_t*>(L"種類");
-        ListView_InsertColumn(g_hwndListView, 1, &col);
-        col.cx   = 80;  col.fmt = LVCFMT_RIGHT;
-        col.pszText = const_cast<wchar_t*>(L"サイズ");
-        ListView_InsertColumn(g_hwndListView, 2, &col);
-        col.cx   = 130; col.fmt = LVCFMT_LEFT;
-        col.pszText = const_cast<wchar_t*>(L"更新日時");
-        ListView_InsertColumn(g_hwndListView, 3, &col);
+        // タブ サブクラス化
+        SetWindowSubclass(g_hwndBigTab,   BigTabSubclassProc,   101, 0);
+        SetWindowSubclass(g_hwndSmallTab, SmallTabSubclassProc, 102, 0);
 
         // ビッグタブ初期化
         for (int i = 0; i < (int)g_bigTabs.size(); i++) {
@@ -923,85 +895,70 @@ static LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             TabCtrl_SetCurSel(g_hwndBigTab, g_bigTabIdx);
 
         RebuildSmallTabs();
-        RebuildQAButtons();
 
+        // IExplorerBrowser 初期化
+        HRESULT hr = CoCreateInstance(CLSID_ExplorerBrowser, nullptr,
+            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_peb));
+        if (SUCCEEDED(hr)) {
+            RECT rc = {0, 0, 400, 400};
+            FOLDERSETTINGS fs = { FVM_DETAILS, FWF_AUTOARRANGE };
+            g_peb->Initialize(hwnd, &rc, &fs);
+            g_peb->SetOptions(EBO_NOBORDER | EBO_ALWAYSNAVIGATE);
+
+            // 初期ナビゲーション
+            NavigateExplorerToCurrentTab();
+        } else {
+            Log(L"IExplorerBrowser の作成に失敗しました。");
+        }
         return 0;
+    }
+
+    case WM_ERASEBKGND: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_hBrushBg ? g_hBrushBg : (HBRUSH)(COLOR_BTNFACE + 1));
+        return 1;
     }
 
     case WM_SIZE:
         DoRightLayout(hwnd);
         return 0;
 
-    case WM_COMMAND: {
-        int id = LOWORD(wp);
-        if (id == 103) {
-            // QA トグル
-            g_qaVisible = !g_qaVisible;
-            SetWindowTextW(g_hwndQAToggle,
-                g_qaVisible ? L"▲ クイックアクセス" : L"▼ クイックアクセス");
-            DoRightLayout(hwnd);
-            SaveState();
-        } else if (id == 104) {
-            // 上へ
-            NavigateUp();
-        }
-        return 0;
-    }
-
     case WM_NOTIFY: {
         auto* nmhdr = reinterpret_cast<NMHDR*>(lp);
-        // Big タブ切り替え
+        // ビッグタブ切り替え
         if (nmhdr->hwndFrom == g_hwndBigTab && nmhdr->code == TCN_SELCHANGE) {
             int sel = TabCtrl_GetCurSel(g_hwndBigTab);
             if (sel >= 0) {
                 g_bigTabIdx = sel;
                 RebuildSmallTabs();
-                NavigateToCurrentTab();
+                NavigateExplorerToCurrentTab();
             }
             return 0;
         }
-        // Small タブ切り替え
+        // スモールタブ切り替え
         if (nmhdr->hwndFrom == g_hwndSmallTab && nmhdr->code == TCN_SELCHANGE) {
             int sel = TabCtrl_GetCurSel(g_hwndSmallTab);
             if (sel >= 0 && g_bigTabIdx < (int)g_bigTabs.size()) {
                 g_bigTabs[g_bigTabIdx].smallTabIdx = sel;
-                NavigateToCurrentTab();
+                NavigateExplorerToCurrentTab();
             }
             return 0;
         }
-        // ListView 通知
-        if (nmhdr->hwndFrom == g_hwndListView) {
-            if (nmhdr->code == NM_DBLCLK) {
-                auto* nmi = reinterpret_cast<NMITEMACTIVATE*>(lp);
-                OnListViewDblClick(nmi->iItem);
-                return 0;
-            }
-            if (nmhdr->code == NM_RCLICK) {
-                auto* nmi = reinterpret_cast<NMITEMACTIVATE*>(lp);
-                OnListViewRightClick(hwnd, nmi->iItem);
-                return 0;
-            }
-            if (nmhdr->code == NM_CUSTOMDRAW) {
-                auto* ncd = reinterpret_cast<NMLVCUSTOMDRAW*>(lp);
-                switch (ncd->nmcd.dwDrawStage) {
-                case CDDS_PREPAINT:
-                    SetWindowLongPtrW(hwnd, DWLP_MSGRESULT, CDRF_NOTIFYITEMDRAW);
-                    return CDRF_NOTIFYITEMDRAW;
-                case CDDS_ITEMPREPAINT: {
-                    int idx = static_cast<int>(ncd->nmcd.lItemlParam);
-                    if (idx >= 0 && idx < (int)g_fileItems.size()) {
-                        if (!g_fileItems[idx].supported) {
-                            ncd->clrText = GetSysColor(COLOR_GRAYTEXT);
-                        }
-                    }
-                    return CDRF_NEWFONT;
-                }
-                }
-                return CDRF_DODEFAULT;
-            }
-        }
         break;
     }
+
+    case WM_DESTROY:
+        if (g_peb) {
+            g_peb->Destroy();
+            g_peb->Release();
+            g_peb = nullptr;
+        }
+        if (g_hFontBig)    { DeleteObject(g_hFontBig);    g_hFontBig    = nullptr; }
+        if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = nullptr; }
+        if (g_hBrushBg)    { DeleteObject(g_hBrushBg);    g_hBrushBg    = nullptr; }
+        return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -1015,8 +972,6 @@ static void SaveState() {
 
     WritePrivateProfileStringW(L"Window", L"SplitX",
         std::to_wstring(g_splitX).c_str(), ini.c_str());
-    WritePrivateProfileStringW(L"Window", L"QuickAccessVisible",
-        std::to_wstring(g_qaVisible ? 1 : 0).c_str(), ini.c_str());
 
     WritePrivateProfileStringW(L"Tabs", L"BigTabCount",
         std::to_wstring(g_bigTabs.size()).c_str(), ini.c_str());
@@ -1043,22 +998,12 @@ static void SaveState() {
                 g_bigTabs[i].smallTabs[j].path.c_str(), ini.c_str());
         }
     }
-
-    // Quick Access
-    WritePrivateProfileStringW(L"QuickAccess", L"Count",
-        std::to_wstring(g_qaItems.size()).c_str(), ini.c_str());
-    for (int i = 0; i < (int)g_qaItems.size(); i++) {
-        WritePrivateProfileStringW(L"QuickAccess",
-            (L"Path_" + std::to_wstring(i)).c_str(),
-            g_qaItems[i].path.c_str(), ini.c_str());
-    }
 }
 
 static void LoadState() {
     auto ini = GetIniPath();
 
-    g_splitX  = GetPrivateProfileIntW(L"Window", L"SplitX", 400, ini.c_str());
-    g_qaVisible = GetPrivateProfileIntW(L"Window", L"QuickAccessVisible", 1, ini.c_str()) != 0;
+    g_splitX = GetPrivateProfileIntW(L"Window", L"SplitX", 400, ini.c_str());
 
     int bigCount = GetPrivateProfileIntW(L"Tabs", L"BigTabCount", 0, ini.c_str());
     g_bigTabIdx  = GetPrivateProfileIntW(L"Tabs", L"BigTabIndex",  0, ini.c_str());
@@ -1066,11 +1011,13 @@ static void LoadState() {
     g_bigTabs.clear();
 
     if (bigCount == 0) {
-        // デフォルト: 1つ作成
+        // デフォルト構造
         BigTab bt;
         bt.name = L"動画";
-        SmallTab st; st.name = L"サンプル"; st.path = L"";
-        bt.smallTabs.push_back(st);
+        SmallTab qa;     qa.name = L"クイックアクセス"; qa.path = L"";
+        SmallTab sample; sample.name = L"素材フォルダ"; sample.path = L"";
+        bt.smallTabs.push_back(qa);
+        bt.smallTabs.push_back(sample);
         g_bigTabs.push_back(bt);
         g_bigTabIdx = 0;
     } else {
@@ -1102,18 +1049,6 @@ static void LoadState() {
 
     if (g_bigTabIdx < 0 || g_bigTabIdx >= (int)g_bigTabs.size())
         g_bigTabIdx = 0;
-
-    // Quick Access
-    int qaCount = GetPrivateProfileIntW(L"QuickAccess", L"Count", 0, ini.c_str());
-    g_qaItems.clear();
-    for (int i = 0; i < qaCount; i++) {
-        wchar_t pbuf[MAX_PATH]{};
-        GetPrivateProfileStringW(L"QuickAccess",
-            (L"Path_" + std::to_wstring(i)).c_str(),
-            L"", pbuf, MAX_PATH, ini.c_str());
-        QAItem qa; qa.path = pbuf;
-        g_qaItems.push_back(qa);
-    }
 }
 
 //------------------------------------------------------------------------------
@@ -1304,6 +1239,24 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    case WM_ERASEBKGND: {
+        // スプリッター領域をテーマ背景色で塗りつぶす
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_hBrushBg ? g_hBrushBg : (HBRUSH)(COLOR_WINDOW + 1));
+        return 1;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+        // 診断ログ EDIT をテーマ色で表示
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        SetTextColor(hdc, g_clrText);
+        SetBkColor(hdc, g_clrBg);
+        return reinterpret_cast<LRESULT>(g_hBrushBg ? g_hBrushBg : (HBRUSH)(COLOR_WINDOW + 1));
+    }
+
     case WM_DESTROY:
         SaveState();
         return 0;
@@ -1321,32 +1274,37 @@ EXTERN_C __declspec(dllexport) bool  InitializePlugin(DWORD)           { return 
 EXTERN_C __declspec(dllexport) void  UninitializePlugin()              {}
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
-    host->set_plugin_information(L"Preview edit + Explorer version 0.1");
+    host->set_plugin_information(L"Preview edit + Explorer version 0.2");
 
-    INITCOMMONCONTROLSEX icex{ sizeof(icex), ICC_WIN95_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES };
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    // テーマ初期化 (InitializeConfig → RegisterPlugin の順なので g_config は有効)
+    InitTheme();
+
+    INITCOMMONCONTROLSEX icex{ sizeof(icex), ICC_WIN95_CLASSES | ICC_TAB_CLASSES };
     InitCommonControlsEx(&icex);
 
     HINSTANCE hi = GetModuleHandleW(nullptr);
 
-    // Main ウィンドウクラス
+    // Main ウィンドウクラス (WM_ERASEBKGND で塗るため NULL でも可、念のため設定)
     {
         WNDCLASSEXW wcex{};
         wcex.cbSize        = sizeof(wcex);
         wcex.lpszClassName = WC_MAIN;
         wcex.lpfnWndProc   = MainWndProc;
         wcex.hInstance     = hi;
-        wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wcex.hbrBackground = g_hBrushBg ? g_hBrushBg : (HBRUSH)(COLOR_WINDOW + 1);
         wcex.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
         RegisterClassExW(&wcex);
     }
-    // Right ウィンドウクラス
+    // Right ウィンドウクラス (WM_ERASEBKGND で塗るため NULL でも可)
     {
         WNDCLASSEXW wcex{};
         wcex.cbSize        = sizeof(wcex);
         wcex.lpszClassName = WC_RIGHT;
         wcex.lpfnWndProc   = RightWndProc;
         wcex.hInstance     = hi;
-        wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wcex.hbrBackground = g_hBrushBg ? g_hBrushBg : (HBRUSH)(COLOR_BTNFACE + 1);
         wcex.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
         RegisterClassExW(&wcex);
     }
@@ -1361,13 +1319,14 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
         wcex.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
         RegisterClassExW(&wcex);
     }
-    // QA パネルクラス
+    // InputDlg ウィンドウクラス
     {
         WNDCLASSEXW wcex{};
         wcex.cbSize        = sizeof(wcex);
-        wcex.lpszClassName = L"PreviewExplorer_QAPanel";
-        wcex.lpfnWndProc   = QAPanelProc;
+        wcex.lpszClassName = WC_INPUTDLG;
+        wcex.lpfnWndProc   = InputDlgProc;
         wcex.hInstance     = hi;
+        wcex.cbWndExtra    = sizeof(LONG_PTR);
         wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wcex.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
         RegisterClassExW(&wcex);
@@ -1381,6 +1340,9 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
         CW_USEDEFAULT, CW_USEDEFAULT,
         nullptr, nullptr, hi, nullptr);
     if (!g_hwndMain) return;
+
+    // ダークモード適用 (Windows 10 1809+)
+    TrySetDarkMode(g_hwndMain);
 
     host->register_window_client(L"Preview edit + Explorer", g_hwndMain);
     g_editHandle = host->create_edit_handle();
