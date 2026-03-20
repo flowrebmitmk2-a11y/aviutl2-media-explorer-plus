@@ -22,8 +22,16 @@
 //------------------------------------------------------------------------------
 // データ構造
 //------------------------------------------------------------------------------
-struct SmallTab { std::wstring name, path; };
+struct SmallTab {
+    std::wstring name;
+    std::wstring path;         // 初期位置 (右クリック「パス変更」等で設定)
+    std::wstring currentPath;  // 最後に表示していた場所 (タブごとの位置状態)
+};
 struct BigTab   { std::wstring name; std::vector<SmallTab> smallTabs; int smallTabIdx = 0; };
+
+// カスタム多段タブレイアウト (TabsSubclass.cpp で定義)
+struct TabPos { RECT rc; };
+std::vector<TabPos> ComputeTabLayout(HWND hwnd, HFONT hFont, int W);
 
 //------------------------------------------------------------------------------
 // ウィンドウクラス名

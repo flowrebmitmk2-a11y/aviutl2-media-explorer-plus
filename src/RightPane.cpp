@@ -2,16 +2,27 @@
 //  PreviewExplorer - 右ペイン (IExplorerBrowser + ナビゲーション)
 //----------------------------------------------------------------------------------
 #include "MediaExplorer.h"
+#include <commdlg.h>
 
 // TabsSubclass.cpp で定義
 LRESULT CALLBACK BigTabSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 LRESULT CALLBACK SmallTabSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 
 // コントロール ID
-constexpr int ID_BTN_BACK = 201;
-constexpr int ID_BTN_FWD  = 202;
-constexpr int ID_BTN_UP   = 203;
+constexpr int ID_BTN_BACK  = 201;
+constexpr int ID_BTN_FWD   = 202;
+constexpr int ID_BTN_UP    = 203;
 constexpr int ID_ADDR_EDIT = 204;
+constexpr int ID_BTN_COPY  = 205;
+constexpr int ID_BTN_CUT   = 206;
+constexpr int ID_BTN_PASTE = 207;
+constexpr int ID_BTN_ALIAS = 208;  // エイリアス(ショートカット)作成
+
+// ナビゲーションバー右側ボタン (RightPane.cpp 内でのみ使用)
+static HWND s_hwndBtnCopy  = nullptr;
+static HWND s_hwndBtnCut   = nullptr;
+static HWND s_hwndBtnPaste = nullptr;
+static HWND s_hwndBtnAlias = nullptr;
 
 //------------------------------------------------------------------------------
 // ダークモードをウィンドウとその子に適用
@@ -70,23 +81,45 @@ public:
     }
 
     STDMETHODIMP OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) override {
-        if (!g_hwndAddrEdit || !pidl) return S_OK;
-        // ファイルシステムパスを取得。仮想フォルダは表示名を使用
-        wchar_t path[MAX_PATH]{};
-        SHGetPathFromIDListW(pidl, path);
-        if (path[0] == L'\0') {
-            // 仮想フォルダ: 表示名を取得
-            IShellItem* psi = nullptr;
-            if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&psi)))) {
-                LPWSTR name = nullptr;
-                if (SUCCEEDED(psi->GetDisplayName(SIGDN_NORMALDISPLAY, &name)) && name) {
-                    wcsncpy_s(path, name, MAX_PATH - 1);
-                    CoTaskMemFree(name);
+        if (!pidl) return S_OK;
+        // タイマーフォールバックが既に予約されていれば取り消す
+        if (g_hwndRight) KillTimer(g_hwndRight, 2 /*TIMER_ADDR_UPDATE*/);
+
+        // パース可能な形式でパスを取得 (FS = 普通のパス、仮想フォルダ = "::{GUID}...")
+        wchar_t parsePath[MAX_PATH]{};
+        wchar_t dispPath[MAX_PATH]{};
+        IShellItem* psi = nullptr;
+        if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&psi)))) {
+            LPWSTR pp = nullptr;
+            // ファイルシステムパスを優先取得
+            if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pp)) && pp) {
+                wcsncpy_s(parsePath, pp, MAX_PATH - 1);
+                wcsncpy_s(dispPath,  pp, MAX_PATH - 1);
+                CoTaskMemFree(pp);
+            } else {
+                // 仮想フォルダ: 表示名をアドレスバーに、パース名を保存用に
+                if (SUCCEEDED(psi->GetDisplayName(SIGDN_NORMALDISPLAY, &pp)) && pp) {
+                    wcsncpy_s(dispPath, pp, MAX_PATH - 1);
+                    CoTaskMemFree(pp);
                 }
-                psi->Release();
+                if (SUCCEEDED(psi->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &pp)) && pp) {
+                    wcsncpy_s(parsePath, pp, MAX_PATH - 1);
+                    CoTaskMemFree(pp);
+                }
             }
+            psi->Release();
         }
-        SetWindowTextW(g_hwndAddrEdit, path);
+
+        // アドレスバー更新
+        if (g_hwndAddrEdit) SetWindowTextW(g_hwndAddrEdit, dispPath);
+
+        // 現在のタブの位置状態を更新 (タブごとの状態保存)
+        if (parsePath[0] &&
+            g_bigTabIdx >= 0 && g_bigTabIdx < (int)g_bigTabs.size()) {
+            auto& bt = g_bigTabs[g_bigTabIdx];
+            if (bt.smallTabIdx >= 0 && bt.smallTabIdx < (int)bt.smallTabs.size())
+                bt.smallTabs[bt.smallTabIdx].currentPath = parsePath;
+        }
         return S_OK;
     }
 
@@ -94,6 +127,253 @@ public:
 };
 
 static CExplorerEvents g_ebEvents;
+
+// アドレスバー遅延更新タイマー ID
+constexpr UINT_PTR TIMER_ADDR_UPDATE = 2;
+
+//------------------------------------------------------------------------------
+// アドレスバーを現在のフォルダに更新
+//  OnNavigationComplete が届かない場合のフォールバック用
+//------------------------------------------------------------------------------
+static void UpdateAddrBar() {
+    if (!g_hwndAddrEdit || !g_peb) return;
+    wchar_t path[MAX_PATH]{};
+
+    IShellView* psv = nullptr;
+    if (FAILED(g_peb->GetCurrentView(IID_PPV_ARGS(&psv)))) return;
+
+    IFolderView2* pfv2 = nullptr;
+    if (SUCCEEDED(psv->QueryInterface(IID_PPV_ARGS(&pfv2)))) {
+        IPersistFolder2* ppf2 = nullptr;
+        if (SUCCEEDED(pfv2->GetFolder(IID_PPV_ARGS(&ppf2)))) {
+            PIDLIST_ABSOLUTE pidl = nullptr;
+            if (SUCCEEDED(ppf2->GetCurFolder(&pidl))) {
+                if (!SHGetPathFromIDListW(pidl, path)) {
+                    // 仮想フォルダ: 表示名を取得
+                    IShellItem* psi = nullptr;
+                    if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&psi)))) {
+                        LPWSTR name = nullptr;
+                        if (SUCCEEDED(psi->GetDisplayName(SIGDN_NORMALDISPLAY, &name)) && name) {
+                            wcsncpy_s(path, name, MAX_PATH - 1);
+                            CoTaskMemFree(name);
+                        }
+                        psi->Release();
+                    }
+                }
+                CoTaskMemFree(pidl);
+            }
+            ppf2->Release();
+        }
+        pfv2->Release();
+    }
+    psv->Release();
+
+    SetWindowTextW(g_hwndAddrEdit, path);
+}
+
+//------------------------------------------------------------------------------
+// タイムライン上のフォーカスオブジェクトのエイリアスを保存
+//  - 保存ダイアログの初期ディレクトリ = 現在表示中のフォルダ
+//  - 保存名デフォルト = プロジェクト名 (拡張子除く) + ".object"
+//  - エイリアスデータは EDIT_SECTION::get_object_alias() で取得 (UTF-8 テキスト)
+//------------------------------------------------------------------------------
+
+// call_edit_section_param のコールバックで使うキャプチャ構造体
+struct AliasCaptureData {
+    std::string aliasBytes;   // get_object_alias の戻り値 (UTF-8)
+    std::wstring projectName; // プロジェクトファイル名 (拡張子なし, ダイアログデフォルト名用)
+};
+
+static void CaptureAliasCallback(void* param, EDIT_SECTION* edit) {
+    if (!edit || !param) return;
+    auto* cap = static_cast<AliasCaptureData*>(param);
+
+    OBJECT_HANDLE obj = edit->get_focus_object();
+    if (!obj) return;
+
+    LPCSTR data = edit->get_object_alias(obj);
+    if (data && data[0]) cap->aliasBytes = data;
+
+    // プロジェクト名を取得 (ファイル名のデフォルト用)
+    if (g_editHandle) {
+        PROJECT_FILE* pf = edit->get_project_file(g_editHandle);
+        if (pf) {
+            LPCWSTR projPath = pf->get_project_file_path();
+            if (projPath && projPath[0]) {
+                wchar_t tmp[MAX_PATH];
+                wcscpy_s(tmp, PathFindFileNameW(projPath));
+                PathRemoveExtensionW(tmp);
+                cap->projectName = tmp;
+            }
+        }
+    }
+}
+
+static void CreateAliasForSelected() {
+    if (!g_editHandle) return;
+
+    AliasCaptureData cap;
+    g_editHandle->call_edit_section_param(&cap, CaptureAliasCallback);
+
+    if (cap.aliasBytes.empty()) {
+        MessageBoxW(g_hwndRight,
+            L"タイムラインでオブジェクトを選択してください。",
+            L"エイリアス保存", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // デフォルト保存名: <プロジェクト名>.object (なければ "alias.object")
+    std::wstring defaultName = cap.projectName.empty() ? L"alias" : cap.projectName;
+    defaultName += L".object";
+
+    // 保存先ダイアログ (初期ディレクトリ = 現在のエクスプローラーフォルダ)
+    wchar_t savePath[MAX_PATH]{};
+    wcscpy_s(savePath, defaultName.c_str());
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize  = sizeof(ofn);
+    ofn.hwndOwner    = g_hwndRight;
+    ofn.lpstrFilter  = L"エイリアスファイル (*.object)\0*.object\0すべてのファイル (*.*)\0*.*\0";
+    ofn.lpstrFile    = savePath;
+    ofn.nMaxFile     = MAX_PATH;
+    ofn.lpstrTitle   = L"エイリアスを名前を付けて保存";
+    ofn.lpstrDefExt  = L"object";
+    ofn.Flags        = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+
+    std::wstring initDir = GetCurrentExplorerPath();
+    if (!initDir.empty()) ofn.lpstrInitialDir = initDir.c_str();
+
+    if (GetSaveFileNameW(&ofn)) {
+        HANDLE hFile = CreateFileW(savePath, GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            DWORD written;
+            WriteFile(hFile, cap.aliasBytes.c_str(),
+                      static_cast<DWORD>(cap.aliasBytes.size()), &written, nullptr);
+            CloseHandle(hFile);
+        } else {
+            MessageBoxW(g_hwndRight, L"ファイルの作成に失敗しました。",
+                        L"エイリアス保存エラー", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// ファイルクリップボード操作
+//  op: 0=コピー, 1=切り取り, 2=貼り付け
+//------------------------------------------------------------------------------
+static void ExecFileOp(int op) {
+    if (!g_peb) return;
+
+    if (op == 2) {
+        // 貼り付け: IFileOperation を使用
+        //  同フォルダ → FOF_RENAMEONCOLLISION で自動リネーム ("～のコピー")
+        //  別フォルダ → デフォルト (IFileOperation が「上書き / スキップ / 両方保存」ダイアログを表示)
+        std::wstring dest = GetCurrentExplorerPath();
+        if (dest.empty()) return;
+
+        IDataObject* pdo = nullptr;
+        if (FAILED(OleGetClipboard(&pdo))) return;
+
+        FORMATETC fe = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM sm{};
+        if (SUCCEEDED(pdo->GetData(&fe, &sm))) {
+            HDROP hDrop = (HDROP)GlobalLock(sm.hGlobal);
+            if (hDrop) {
+                UINT n = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
+                if (n > 0) {
+                    // Move か Copy か判定
+                    bool isMove = false;
+                    UINT cfPDE = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+                    FORMATETC fePDE = { (CLIPFORMAT)cfPDE, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+                    STGMEDIUM smPDE{};
+                    if (SUCCEEDED(pdo->GetData(&fePDE, &smPDE))) {
+                        DWORD* pe = (DWORD*)GlobalLock(smPDE.hGlobal);
+                        if (pe) { isMove = (*pe & DROPEFFECT_MOVE) != 0; GlobalUnlock(smPDE.hGlobal); }
+                        ReleaseStgMedium(&smPDE);
+                    }
+
+                    // 全ソースファイルが貼り付け先と同じフォルダか確認
+                    bool allSameFolder = !isMove;  // Move は同フォルダでも通常動作
+                    for (UINT i = 0; i < n && allSameFolder; i++) {
+                        wchar_t path[MAX_PATH]{};
+                        DragQueryFileW(hDrop, i, path, MAX_PATH);
+                        wchar_t parent[MAX_PATH]{};
+                        wcscpy_s(parent, path);
+                        PathRemoveFileSpecW(parent);  // 末尾の "\" は除去される
+                        if (_wcsicmp(parent, dest.c_str()) != 0) allSameFolder = false;
+                    }
+
+                    IFileOperation* pfo = nullptr;
+                    if (SUCCEEDED(CoCreateInstance(CLSID_FileOperation, nullptr,
+                                                   CLSCTX_ALL, IID_PPV_ARGS(&pfo)))) {
+                        DWORD flags = FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR;
+                        if (allSameFolder)
+                            flags |= FOF_RENAMEONCOLLISION;  // 同フォルダ: "～のコピー" 形式で自動リネーム
+                        // 別フォルダ: ダイアログで「上書き / スキップ / 両方保存」を選択
+                        pfo->SetOperationFlags(flags);
+                        pfo->SetOwnerWindow(g_hwndRight);
+
+                        IShellItem* psiDest = nullptr;
+                        if (SUCCEEDED(SHCreateItemFromParsingName(dest.c_str(), nullptr,
+                                                                   IID_PPV_ARGS(&psiDest)))) {
+                            for (UINT i = 0; i < n; i++) {
+                                wchar_t path[MAX_PATH]{};
+                                DragQueryFileW(hDrop, i, path, MAX_PATH);
+                                IShellItem* psiSrc = nullptr;
+                                if (SUCCEEDED(SHCreateItemFromParsingName(path, nullptr,
+                                                                           IID_PPV_ARGS(&psiSrc)))) {
+                                    if (isMove)
+                                        pfo->MoveItem(psiSrc, psiDest, nullptr, nullptr);
+                                    else
+                                        pfo->CopyItem(psiSrc, psiDest, nullptr, nullptr);
+                                    psiSrc->Release();
+                                }
+                            }
+                            psiDest->Release();
+                        }
+                        pfo->PerformOperations();
+                        pfo->Release();
+                    }
+                }
+                GlobalUnlock(sm.hGlobal);
+            }
+            ReleaseStgMedium(&sm);
+        }
+        pdo->Release();
+        return;
+    }
+
+    // コピー / 切り取り: 選択ファイルを IDataObject としてクリップボードに設定
+    IShellView* psv = nullptr;
+    if (FAILED(g_peb->GetCurrentView(IID_PPV_ARGS(&psv)))) return;
+
+    IFolderView* pfv = nullptr;
+    if (SUCCEEDED(psv->QueryInterface(IID_PPV_ARGS(&pfv)))) {
+        IShellItemArray* psia = nullptr;
+        if (SUCCEEDED(pfv->Items(SVGIO_SELECTION, IID_PPV_ARGS(&psia)))) {
+            IDataObject* pdo = nullptr;
+            if (SUCCEEDED(psia->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&pdo)))) {
+                UINT cfPDE = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+                FORMATETC fe = { (CLIPFORMAT)cfPDE, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+                STGMEDIUM sm{};
+                sm.tymed   = TYMED_HGLOBAL;
+                sm.hGlobal = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+                if (sm.hGlobal) {
+                    DWORD* p = (DWORD*)GlobalLock(sm.hGlobal);
+                    *p = (op == 1) ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
+                    GlobalUnlock(sm.hGlobal);
+                    pdo->SetData(&fe, &sm, TRUE);
+                }
+                OleSetClipboard(pdo);
+                pdo->Release();
+            }
+            psia->Release();
+        }
+        pfv->Release();
+    }
+    psv->Release();
+}
 
 //------------------------------------------------------------------------------
 // キーボードフック (AviUtl の TranslateAccelerator によるCtrl+C/V横取り対策)
@@ -114,19 +394,6 @@ static bool IsFocusInRightPane() {
     return hFocus == g_hwndRight || IsChild(g_hwndRight, hFocus);
 }
 
-static void ExecShellCmd(ULONG cmdId) {
-    if (!g_peb) return;
-    IShellView* psv = nullptr;
-    if (SUCCEEDED(g_peb->GetCurrentView(IID_PPV_ARGS(&psv)))) {
-        IOleCommandTarget* pct = nullptr;
-        if (SUCCEEDED(psv->QueryInterface(IID_PPV_ARGS(&pct)))) {
-            pct->Exec(nullptr, cmdId, OLECMDEXECOPT_DONTPROMPTUSER, nullptr, nullptr);
-            pct->Release();
-        }
-        psv->Release();
-    }
-}
-
 static LRESULT CALLBACK LowLevelKeyHook(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
         auto* khs = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
@@ -135,18 +402,17 @@ static LRESULT CALLBACK LowLevelKeyHook(int nCode, WPARAM wp, LPARAM lp) {
             HWND hFocus = GetFocus();
             UINT vk = khs->vkCode;
             if (hFocus == g_hwndAddrEdit) {
-                // アドレスバー: テキスト編集ショートカット (SendMessage は同スレッドなので安全)
+                // アドレスバー: テキスト編集ショートカット
                 if      (vk == 'C') { SendMessageW(hFocus, WM_COPY,   0, 0); return 1; }
                 else if (vk == 'X') { SendMessageW(hFocus, WM_CUT,    0, 0); return 1; }
                 else if (vk == 'V') { SendMessageW(hFocus, WM_PASTE,  0, 0); return 1; }
                 else if (vk == 'Z') { SendMessageW(hFocus, WM_UNDO,   0, 0); return 1; }
                 else if (vk == 'A') { SendMessageW(hFocus, EM_SETSEL, 0, -1); return 1; }
-            } else if (g_hwndRight) {
-                // シェルビュー: PostMessage でフック外のコンテキストで COM 呼び出し
-                if      (vk == 'C') { PostMessageW(g_hwndRight, WM_EXEC_SHELL_CMD, OLECMDID_COPY,      0); return 1; }
-                else if (vk == 'X') { PostMessageW(g_hwndRight, WM_EXEC_SHELL_CMD, OLECMDID_CUT,       0); return 1; }
-                else if (vk == 'V') { PostMessageW(g_hwndRight, WM_EXEC_SHELL_CMD, OLECMDID_PASTE,     0); return 1; }
-                else if (vk == 'A') { PostMessageW(g_hwndRight, WM_EXEC_SHELL_CMD, OLECMDID_SELECTALL, 0); return 1; }
+            } else if (g_hwndRight &&
+                       (vk == 'C' || vk == 'X' || vk == 'V' || vk == 'A')) {
+                // シェルビュー: PostMessage でフック外で実行 (WPARAM = 仮想キーコード)
+                PostMessageW(g_hwndRight, WM_EXEC_SHELL_CMD, (WPARAM)vk, 0);
+                return 1;
             }
         }
     }
@@ -161,9 +427,13 @@ void NavigateExplorerToCurrentTab() {
     if (g_bigTabIdx < 0 || g_bigTabIdx >= (int)g_bigTabs.size()) return;
     auto& bt = g_bigTabs[g_bigTabIdx];
     if (bt.smallTabIdx < 0 || bt.smallTabIdx >= (int)bt.smallTabs.size()) return;
-    const std::wstring& path = bt.smallTabs[bt.smallTabIdx].path;
+    auto& st = bt.smallTabs[bt.smallTabIdx];
 
-    if (path.empty() || path == L"QuickAccess") {
+    // currentPath があればそちらを優先 (タブごとの位置状態)
+    // なければ path (初期位置) へ
+    const std::wstring& navPath = st.currentPath.empty() ? st.path : st.currentPath;
+
+    if (navPath.empty() || navPath == L"QuickAccess") {
         PIDLIST_ABSOLUTE pidl = nullptr;
         const GUID FOLDERID_QA = {0x679f85cb, 0x0220, 0x4080,
             {0xb2, 0x9b, 0x55, 0x40, 0xcc, 0x05, 0xaa, 0xb6}};
@@ -173,11 +443,13 @@ void NavigateExplorerToCurrentTab() {
         }
     } else {
         IShellItem* psi = nullptr;
-        if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&psi)))) {
+        if (SUCCEEDED(SHCreateItemFromParsingName(navPath.c_str(), nullptr, IID_PPV_ARGS(&psi)))) {
             g_peb->BrowseToObject(psi, SBSP_ABSOLUTE);
             psi->Release();
         }
     }
+    // OnNavigationComplete が届かない場合のフォールバック
+    if (g_hwndRight) SetTimer(g_hwndRight, TIMER_ADDR_UPDATE, 300, nullptr);
 }
 
 //------------------------------------------------------------------------------
@@ -217,6 +489,7 @@ static void NavBack() {
         psb->BrowseObject(nullptr, SBSP_NAVIGATEBACK);
         psb->Release();
     }
+    if (g_hwndRight) SetTimer(g_hwndRight, TIMER_ADDR_UPDATE, 300, nullptr);
 }
 
 static void NavForward() {
@@ -226,6 +499,7 @@ static void NavForward() {
         psb->BrowseObject(nullptr, SBSP_NAVIGATEFORWARD);
         psb->Release();
     }
+    if (g_hwndRight) SetTimer(g_hwndRight, TIMER_ADDR_UPDATE, 300, nullptr);
 }
 
 static void NavUp() {
@@ -244,6 +518,7 @@ static void NavUp() {
         g_peb->BrowseToObject(psi, SBSP_ABSOLUTE);
         psi->Release();
     }
+    if (g_hwndRight) SetTimer(g_hwndRight, TIMER_ADDR_UPDATE, 300, nullptr);
 }
 
 //------------------------------------------------------------------------------
@@ -293,28 +568,50 @@ void RebuildSmallTabs() {
 //------------------------------------------------------------------------------
 // 右ペインのレイアウト
 //------------------------------------------------------------------------------
+
+// ComputeTabLayout を使って多段時の実高さを計算する
+static int CalcTabHeight(HWND hwndTab, HFONT hFont, int W, int baseH) {
+    if (!hwndTab || W <= 0) return baseH;
+    auto layout = ComputeTabLayout(hwndTab, hFont, W);
+    if (layout.empty()) return baseH;
+    int maxBottom = 0;
+    for (auto& p : layout) maxBottom = max(maxBottom, p.rc.bottom);
+    return maxBottom + 6;
+}
+
 void DoRightLayout(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom;
     int y = 0;
 
     if (g_hwndBigTab) {
-        SetWindowPos(g_hwndBigTab, nullptr, 0, y, W, g_bigTabH, SWP_NOZORDER | SWP_NOACTIVATE);
-        y += g_bigTabH;
+        int h = max(CalcTabHeight(g_hwndBigTab, g_hFontBig, W, g_bigTabH), g_bigTabH);
+        SetWindowPos(g_hwndBigTab, nullptr, 0, y, W, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        y += h;
     }
     if (g_hwndSmallTab) {
-        SetWindowPos(g_hwndSmallTab, nullptr, 0, y, W, g_smallTabH, SWP_NOZORDER | SWP_NOACTIVATE);
-        y += g_smallTabH;
+        int h = max(CalcTabHeight(g_hwndSmallTab, g_hFontNormal, W, g_smallTabH), g_smallTabH);
+        SetWindowPos(g_hwndSmallTab, nullptr, 0, y, W, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        y += h;
     }
 
-    // ナビゲーションバー: [←][→][↑][アドレス入力]
+    // ナビゲーションバー: [←][→][↑][アドレス入力][コピー][切取][貼付][リンク]
     if (g_hwndBtnBack) {
-        constexpr int GAP = 2;
+        constexpr int GAP    = 2;
+        constexpr int CLIP_W = 44;
         int x = GAP;
         SetWindowPos(g_hwndBtnBack,  nullptr, x, y + 2, NAV_BTN_W, NAV_BAR_H - 4, SWP_NOZORDER | SWP_NOACTIVATE); x += NAV_BTN_W + GAP;
         SetWindowPos(g_hwndBtnFwd,   nullptr, x, y + 2, NAV_BTN_W, NAV_BAR_H - 4, SWP_NOZORDER | SWP_NOACTIVATE); x += NAV_BTN_W + GAP;
         SetWindowPos(g_hwndBtnUp,    nullptr, x, y + 2, NAV_BTN_W, NAV_BAR_H - 4, SWP_NOZORDER | SWP_NOACTIVATE); x += NAV_BTN_W + GAP;
-        SetWindowPos(g_hwndAddrEdit, nullptr, x, y + 3, W - x - GAP, NAV_BAR_H - 6, SWP_NOZORDER | SWP_NOACTIVATE);
+        // 右端: コピー・切取・貼付・リンク の 4 ボタン
+        int clipStart = W - (CLIP_W + GAP) * 4;
+        int addrW = max(40, clipStart - x - GAP);
+        SetWindowPos(g_hwndAddrEdit,  nullptr, x,         y + 3, addrW,  NAV_BAR_H - 6, SWP_NOZORDER | SWP_NOACTIVATE);
+        int cx = clipStart;
+        SetWindowPos(s_hwndBtnCopy,   nullptr, cx, y + 2, CLIP_W, NAV_BAR_H - 4, SWP_NOZORDER | SWP_NOACTIVATE); cx += CLIP_W + GAP;
+        SetWindowPos(s_hwndBtnCut,    nullptr, cx, y + 2, CLIP_W, NAV_BAR_H - 4, SWP_NOZORDER | SWP_NOACTIVATE); cx += CLIP_W + GAP;
+        SetWindowPos(s_hwndBtnPaste,  nullptr, cx, y + 2, CLIP_W, NAV_BAR_H - 4, SWP_NOZORDER | SWP_NOACTIVATE); cx += CLIP_W + GAP;
+        SetWindowPos(s_hwndBtnAlias,  nullptr, cx, y + 2, CLIP_W, NAV_BAR_H - 4, SWP_NOZORDER | SWP_NOACTIVATE);
         y += NAV_BAR_H;
     }
 
@@ -333,14 +630,16 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HINSTANCE hi = GetModuleHandleW(nullptr);
 
         // ── ビッグタブ ──
+        // TCS_MULTILINE: スクロール矢印を抑制するために必要。
+        // 行入れ替えは WM_PAINT を完全上書きしているので視覚的に無関係。
         g_hwndBigTab = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
-            WS_CHILD | WS_VISIBLE | TCS_HOTTRACK,
+            WS_CHILD | WS_VISIBLE | TCS_HOTTRACK | TCS_MULTILINE,
             0, 0, 100, 36, hwnd, reinterpret_cast<HMENU>(101), hi, nullptr);
         if (g_hFontBig) SendMessageW(g_hwndBigTab, WM_SETFONT, (WPARAM)g_hFontBig, TRUE);
 
         // ── スモールタブ ──
         g_hwndSmallTab = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | TCS_MULTILINE,
             0, 36, 100, 24, hwnd, reinterpret_cast<HMENU>(102), hi, nullptr);
         if (g_hFontNormal) SendMessageW(g_hwndSmallTab, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
@@ -359,13 +658,15 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_bigTabs.empty()) TabCtrl_SetCurSel(g_hwndBigTab, g_bigTabIdx);
         RebuildSmallTabs();
 
-        // タブ高さを動的計測 (フォント適用後に実際の高さを取得)
+        // タブ高さを動的計測 (フォント適用後に実際の行高さを取得)
+        // TCS_MULTILINE では選択行が底部に配置されるため tr.bottom はコントロール高さと一致する場合がある。
+        // 行の実高さは (tr.bottom - tr.top) で取得する。
         {
             RECT tr{};
-            if (g_hwndBigTab && TabCtrl_GetItemRect(g_hwndBigTab, 0, &tr) && tr.bottom > 0)
-                g_bigTabH = tr.bottom + 6;
-            if (g_hwndSmallTab && TabCtrl_GetItemRect(g_hwndSmallTab, 0, &tr) && tr.bottom > 0)
-                g_smallTabH = tr.bottom + 4;
+            if (g_hwndBigTab && TabCtrl_GetItemRect(g_hwndBigTab, 0, &tr) && tr.bottom > tr.top)
+                g_bigTabH = (tr.bottom - tr.top) + 8;
+            if (g_hwndSmallTab && TabCtrl_GetItemRect(g_hwndSmallTab, 0, &tr) && tr.bottom > tr.top)
+                g_smallTabH = (tr.bottom - tr.top) + 6;
         }
 
         // ── ナビゲーションバー ──
@@ -386,8 +687,24 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // (g_hFontNormal はタブ専用。アドレスバーに適用すると大きすぎる)
         SetWindowSubclass(g_hwndAddrEdit, AddrEditSubclassProc, ID_ADDR_EDIT, 0);
 
+        // ── クリップボード / エイリアスボタン ──
+        s_hwndBtnCopy  = CreateWindowExW(0, L"BUTTON", L"コピー",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 44, NAV_BAR_H, hwnd, reinterpret_cast<HMENU>(ID_BTN_COPY), hi, nullptr);
+        s_hwndBtnCut   = CreateWindowExW(0, L"BUTTON", L"切取",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 44, NAV_BAR_H, hwnd, reinterpret_cast<HMENU>(ID_BTN_CUT),  hi, nullptr);
+        s_hwndBtnPaste = CreateWindowExW(0, L"BUTTON", L"貼付",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 44, NAV_BAR_H, hwnd, reinterpret_cast<HMENU>(ID_BTN_PASTE), hi, nullptr);
+        // 選択ファイルの .lnk ショートカットを保存ダイアログ経由で作成
+        s_hwndBtnAlias = CreateWindowExW(0, L"BUTTON", L"リンク",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 44, NAV_BAR_H, hwnd, reinterpret_cast<HMENU>(ID_BTN_ALIAS), hi, nullptr);
+
         // ボタン・アドレスバーにダークテーマを適用
-        for (HWND h : {g_hwndBtnBack, g_hwndBtnFwd, g_hwndBtnUp}) {
+        for (HWND h : {g_hwndBtnBack, g_hwndBtnFwd, g_hwndBtnUp,
+                       s_hwndBtnCopy, s_hwndBtnCut, s_hwndBtnPaste, s_hwndBtnAlias}) {
             ApplyDarkToWindow(h);
             SetWindowTheme(h, L"DarkMode_Explorer", nullptr);
         }
@@ -409,16 +726,8 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_peb->Initialize(hwnd, &rc, &fs);
             g_peb->SetOptions(static_cast<EXPLORER_BROWSER_OPTIONS>(EBO_NOBORDER | EBO_ALWAYSNAVIGATE));
 
-            // イベント登録
-            IConnectionPointContainer* pcpc = nullptr;
-            if (SUCCEEDED(g_peb->QueryInterface(IID_PPV_ARGS(&pcpc)))) {
-                IConnectionPoint* pcp = nullptr;
-                if (SUCCEEDED(pcpc->FindConnectionPoint(IID_IExplorerBrowserEvents, &pcp))) {
-                    pcp->Advise(&g_ebEvents, &g_ebEvents.m_cookie);
-                    pcp->Release();
-                }
-                pcpc->Release();
-            }
+            // イベント登録 (IExplorerBrowser::Advise を直接使用)
+            g_peb->Advise(&g_ebEvents, &g_ebEvents.m_cookie);
 
             NavigateExplorerToCurrentTab();
         } else {
@@ -431,11 +740,22 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DoRightLayout(hwnd);
         return 0;
 
+    case WM_TIMER:
+        if (wp == TIMER_ADDR_UPDATE) {
+            KillTimer(hwnd, TIMER_ADDR_UPDATE);
+            UpdateAddrBar();
+        }
+        return 0;
+
     case WM_COMMAND: {
         int id = LOWORD(wp);
-        if (id == ID_BTN_BACK) { NavBack();    return 0; }
-        if (id == ID_BTN_FWD)  { NavForward(); return 0; }
-        if (id == ID_BTN_UP)   { NavUp();      return 0; }
+        if (id == ID_BTN_BACK)  { NavBack();                return 0; }
+        if (id == ID_BTN_FWD)   { NavForward();             return 0; }
+        if (id == ID_BTN_UP)    { NavUp();                  return 0; }
+        if (id == ID_BTN_COPY)  { ExecFileOp(0);            return 0; }
+        if (id == ID_BTN_CUT)   { ExecFileOp(1);            return 0; }
+        if (id == ID_BTN_PASTE) { ExecFileOp(2);            return 0; }
+        if (id == ID_BTN_ALIAS) { CreateAliasForSelected(); return 0; }
         break;
     }
 
@@ -443,8 +763,10 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* nmhdr = reinterpret_cast<NMHDR*>(lp);
 
         // ── ボタン NM_CUSTOMDRAW : ダーク描画 ──
-        if ((nmhdr->hwndFrom == g_hwndBtnBack || nmhdr->hwndFrom == g_hwndBtnFwd ||
-             nmhdr->hwndFrom == g_hwndBtnUp)
+        if ((nmhdr->hwndFrom == g_hwndBtnBack  || nmhdr->hwndFrom == g_hwndBtnFwd  ||
+             nmhdr->hwndFrom == g_hwndBtnUp    || nmhdr->hwndFrom == s_hwndBtnCopy ||
+             nmhdr->hwndFrom == s_hwndBtnCut   || nmhdr->hwndFrom == s_hwndBtnPaste ||
+             nmhdr->hwndFrom == s_hwndBtnAlias)
             && nmhdr->code == NM_CUSTOMDRAW) {
             auto* nmcd = reinterpret_cast<NMCUSTOMDRAW*>(lp);
             if (nmcd->dwDrawStage == CDDS_PREPAINT) {
@@ -482,14 +804,19 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (nmhdr->hwndFrom == g_hwndBigTab && nmhdr->code == TCN_SELCHANGE) {
             int sel = TabCtrl_GetCurSel(g_hwndBigTab);
-            if (sel >= 0) { g_bigTabIdx = sel; RebuildSmallTabs(); NavigateExplorerToCurrentTab(); }
+            if (sel >= 0) {
+                g_bigTabIdx = sel;
+                RebuildSmallTabs();
+                DoRightLayout(hwnd);  // スモールタブ行数が変わる可能性があるため再計算
+                NavigateExplorerToCurrentTab();  // タブの保存済み位置 (currentPath) へ移動
+            }
             return 0;
         }
         if (nmhdr->hwndFrom == g_hwndSmallTab && nmhdr->code == TCN_SELCHANGE) {
             int sel = TabCtrl_GetCurSel(g_hwndSmallTab);
             if (sel >= 0 && g_bigTabIdx < (int)g_bigTabs.size()) {
                 g_bigTabs[g_bigTabIdx].smallTabIdx = sel;
-                NavigateExplorerToCurrentTab();
+                NavigateExplorerToCurrentTab();  // タブの保存済み位置 (currentPath) へ移動
             }
             return 0;
         }
@@ -502,9 +829,13 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 1;
     }
 
-    case WM_EXEC_SHELL_CMD:
-        ExecShellCmd(static_cast<ULONG>(wp));
+    case WM_EXEC_SHELL_CMD: {
+        UINT vk = static_cast<UINT>(wp);
+        if      (vk == 'C') ExecFileOp(0);
+        else if (vk == 'X') ExecFileOp(1);
+        else if (vk == 'V') ExecFileOp(2);
         return 0;
+    }
 
     case WM_CTLCOLOREDIT: {
         // アドレスバーのダーク色
@@ -530,15 +861,7 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_hKeyHook) { UnhookWindowsHookEx(g_hKeyHook); g_hKeyHook = nullptr; }
         // イベント解除
         if (g_peb && g_ebEvents.m_cookie) {
-            IConnectionPointContainer* pcpc = nullptr;
-            if (SUCCEEDED(g_peb->QueryInterface(IID_PPV_ARGS(&pcpc)))) {
-                IConnectionPoint* pcp = nullptr;
-                if (SUCCEEDED(pcpc->FindConnectionPoint(IID_IExplorerBrowserEvents, &pcp))) {
-                    pcp->Unadvise(g_ebEvents.m_cookie);
-                    pcp->Release();
-                }
-                pcpc->Release();
-            }
+            g_peb->Unadvise(g_ebEvents.m_cookie);
             g_ebEvents.m_cookie = 0;
         }
         if (g_peb) { g_peb->Destroy(); g_peb->Release(); g_peb = nullptr; }
@@ -547,6 +870,7 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_hBrushBg)    { DeleteObject(g_hBrushBg);    g_hBrushBg    = nullptr; }
         g_hwndBigTab = g_hwndSmallTab = nullptr;
         g_hwndBtnBack = g_hwndBtnFwd = g_hwndBtnUp = g_hwndAddrEdit = nullptr;
+        s_hwndBtnCopy = s_hwndBtnCut = s_hwndBtnPaste = s_hwndBtnAlias = nullptr;
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);

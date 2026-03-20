@@ -158,12 +158,17 @@ void SaveState() {
         WritePrivateProfileStringW(sec.c_str(), L"SmallTabCount",
             std::to_wstring(g_bigTabs[i].smallTabs.size()).c_str(), ini.c_str());
         for (int j = 0; j < (int)g_bigTabs[i].smallTabs.size(); j++) {
+            auto& st = g_bigTabs[i].smallTabs[j];
             WritePrivateProfileStringW(sec.c_str(),
                 (L"SmallTab_" + std::to_wstring(j) + L"_Name").c_str(),
-                g_bigTabs[i].smallTabs[j].name.c_str(), ini.c_str());
+                st.name.c_str(), ini.c_str());
             WritePrivateProfileStringW(sec.c_str(),
                 (L"SmallTab_" + std::to_wstring(j) + L"_Path").c_str(),
-                g_bigTabs[i].smallTabs[j].path.c_str(), ini.c_str());
+                st.path.c_str(), ini.c_str());
+            // 最後にいた場所も保存 (タブごとの位置状態)
+            WritePrivateProfileStringW(sec.c_str(),
+                (L"SmallTab_" + std::to_wstring(j) + L"_CurrentPath").c_str(),
+                st.currentPath.c_str(), ini.c_str());
         }
     }
 }
@@ -200,12 +205,14 @@ void LoadState() {
                 (L"SmallTabIndex_" + std::to_wstring(i)).c_str(), 0, ini.c_str());
             int stCount = GetPrivateProfileIntW(sec.c_str(), L"SmallTabCount", 0, ini.c_str());
             for (int j = 0; j < stCount; j++) {
-                wchar_t sn[256]{}, sp[MAX_PATH]{};
+                wchar_t sn[256]{}, sp[MAX_PATH]{}, scp[MAX_PATH]{};
                 GetPrivateProfileStringW(sec.c_str(),
                     (L"SmallTab_" + std::to_wstring(j) + L"_Name").c_str(), L"", sn, 256, ini.c_str());
                 GetPrivateProfileStringW(sec.c_str(),
                     (L"SmallTab_" + std::to_wstring(j) + L"_Path").c_str(), L"", sp, MAX_PATH, ini.c_str());
-                bt.smallTabs.push_back({ sn, sp });
+                GetPrivateProfileStringW(sec.c_str(),
+                    (L"SmallTab_" + std::to_wstring(j) + L"_CurrentPath").c_str(), L"", scp, MAX_PATH, ini.c_str());
+                bt.smallTabs.push_back({ sn, sp, scp });
             }
             g_bigTabs.push_back(bt);
         }
@@ -400,7 +407,7 @@ EXTERN_C __declspec(dllexport) bool  InitializePlugin(DWORD)            { return
 EXTERN_C __declspec(dllexport) void  UninitializePlugin()               {}
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
-    host->set_plugin_information(L"Preview edit + Explorer version 0.5");
+    host->set_plugin_information(L"Preview edit + Explorer version 0.8");
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
