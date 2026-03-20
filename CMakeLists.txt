@@ -12,6 +12,9 @@ add_compile_definitions(UNICODE _UNICODE)
 
 add_library(PreviewExplorer SHARED
     src/MediaExplorer.cpp
+    src/RightPane.cpp
+    src/TabsSubclass.cpp
+    src/SettingsDialog.cpp
 )
 
 target_include_directories(PreviewExplorer PRIVATE
@@ -20,7 +23,7 @@ target_include_directories(PreviewExplorer PRIVATE
 )
 
 target_link_libraries(PreviewExplorer PRIVATE
-    user32 comctl32 comdlg32 shlwapi shell32
+    user32 comctl32 comdlg32 shlwapi shell32 ole32 oleaut32 dwmapi
 )
 
 set_target_properties(PreviewExplorer PROPERTIES SUFFIX ".aux2")
