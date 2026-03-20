@@ -697,8 +697,8 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         s_hwndBtnPaste = CreateWindowExW(0, L"BUTTON", L"貼付",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 44, NAV_BAR_H, hwnd, reinterpret_cast<HMENU>(ID_BTN_PASTE), hi, nullptr);
-        // 選択ファイルの .lnk ショートカットを保存ダイアログ経由で作成
-        s_hwndBtnAlias = CreateWindowExW(0, L"BUTTON", L"リンク",
+        // 選択中のオブジェクトを現在のディレクトリに保存するダイアログを開く
+        s_hwndBtnAlias = CreateWindowExW(0, L"BUTTON", L"A保存",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 44, NAV_BAR_H, hwnd, reinterpret_cast<HMENU>(ID_BTN_ALIAS), hi, nullptr);
 
