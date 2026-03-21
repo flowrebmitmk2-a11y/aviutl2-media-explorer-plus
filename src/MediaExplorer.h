@@ -46,6 +46,7 @@ constexpr int MIN_LEFT_W  = 100;
 constexpr int MIN_RIGHT_W = 200;
 constexpr int NAV_BAR_H   = 28;   // ナビゲーションバー高さ (固定)
 constexpr int NAV_BTN_W   = 28;   // 戻る/進む/上へ ボタン幅
+constexpr int STATUS_H    = 20;   // 選択ファイル表示ステータスバー高さ
 
 //------------------------------------------------------------------------------
 // グローバル変数宣言 (定義は MediaExplorer.cpp)

@@ -8,6 +8,7 @@
 LRESULT CALLBACK BigTabSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 LRESULT CALLBACK SmallTabSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 
+
 // コントロール ID
 constexpr int ID_BTN_BACK  = 201;
 constexpr int ID_BTN_FWD   = 202;
@@ -71,11 +72,15 @@ public:
     STDMETHODIMP OnNavigationPending(PCIDLIST_ABSOLUTE) override { return S_OK; }
 
     STDMETHODIMP OnViewCreated(IShellView* psv) override {
-        // シェルビューウィンドウにダークテーマ適用
         HWND hwndSV = nullptr;
         if (SUCCEEDED(psv->GetWindow(&hwndSV)) && hwndSV) {
-            ApplyDarkToWindow(hwndSV);
-            EnumChildWindows(hwndSV, ApplyDarkChildCb, 0);
+            // IExplorerBrowser は OS のダークモードを自前で処理するため手動適用しない
+            // ListView に LVS_SHOWSELALWAYS を追加 (フォーカスなしでも選択ハイライトを維持)
+            HWND hwndLV = FindWindowExW(hwndSV, nullptr, WC_LISTVIEW, nullptr);
+            if (hwndLV) {
+                LONG_PTR style = GetWindowLongPtrW(hwndLV, GWL_STYLE);
+                SetWindowLongPtrW(hwndLV, GWL_STYLE, style | LVS_SHOWSELALWAYS);
+            }
         }
         return S_OK;
     }
@@ -128,7 +133,7 @@ public:
 
 static CExplorerEvents g_ebEvents;
 
-// アドレスバー遅延更新タイマー ID
+// タイマー ID
 constexpr UINT_PTR TIMER_ADDR_UPDATE = 2;
 
 //------------------------------------------------------------------------------
@@ -170,6 +175,7 @@ static void UpdateAddrBar() {
 
     SetWindowTextW(g_hwndAddrEdit, path);
 }
+
 
 //------------------------------------------------------------------------------
 // タイムライン上のフォーカスオブジェクトのエイリアスを保存
@@ -702,6 +708,7 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 44, NAV_BAR_H, hwnd, reinterpret_cast<HMENU>(ID_BTN_ALIAS), hi, nullptr);
 
+        // ── ステータスバー（選択ファイル名表示） ──
         // ボタン・アドレスバーにダークテーマを適用
         for (HWND h : {g_hwndBtnBack, g_hwndBtnFwd, g_hwndBtnUp,
                        s_hwndBtnCopy, s_hwndBtnCut, s_hwndBtnPaste, s_hwndBtnAlias}) {
@@ -725,6 +732,8 @@ LRESULT CALLBACK RightWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             fs.fFlags   = FWF_AUTOARRANGE | FWF_NOSUBFOLDERS & 0;  // デフォルト
             g_peb->Initialize(hwnd, &rc, &fs);
             g_peb->SetOptions(static_cast<EXPLORER_BROWSER_OPTIONS>(EBO_NOBORDER | EBO_ALWAYSNAVIGATE));
+            // フォルダごとの列幅・ソート順・表示モードをレジストリに保存
+            g_peb->SetPropertyBag(L"PreviewExplorer");
 
             // イベント登録 (IExplorerBrowser::Advise を直接使用)
             g_peb->Advise(&g_ebEvents, &g_ebEvents.m_cookie);

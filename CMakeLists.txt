@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    add_compile_options(/source-charset:utf-8)
+    add_compile_options(/source-charset:utf-8 /wd4828)
 endif()
 
 add_compile_definitions(UNICODE _UNICODE)
