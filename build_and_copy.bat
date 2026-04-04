@@ -4,8 +4,8 @@ setlocal
 cd /d "%~dp0"
 
 set BUILD_DIR=%~dp0build
-set OUTPUT=%BUILD_DIR%\Release\PreviewExplorer.aux2
-set DEST=e:\important\aviutl2_latest\data\Plugin\PreviewExplorer.aux2
+set OUTPUT=%BUILD_DIR%\Release\MediaExplorerPlus.aux2
+set DEST=e:\important\aviutl2_latest\data\Plugin\MediaExplorerPlus.aux2
 
 echo ==========================================
 echo  Building...

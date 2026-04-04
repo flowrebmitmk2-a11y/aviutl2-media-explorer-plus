@@ -36,8 +36,8 @@ std::vector<TabPos> ComputeTabLayout(HWND hwnd, HFONT hFont, int W);
 //------------------------------------------------------------------------------
 // ウィンドウクラス名
 //------------------------------------------------------------------------------
-constexpr wchar_t WC_MAIN[]  = L"PreviewExplorer_Main";
-constexpr wchar_t WC_RIGHT[] = L"PreviewExplorer_Right";
+constexpr wchar_t WC_MAIN[]  = L"MediaExplorerPlus_Main";
+constexpr wchar_t WC_RIGHT[] = L"MediaExplorerPlus_Right";
 
 //------------------------------------------------------------------------------
 // レイアウト定数
