@@ -14,6 +14,52 @@ static struct {
 } s_bigDrag, s_smallDrag;
 
 //------------------------------------------------------------------------------
+// タブコピーペースト用クリップボード [改善2]
+//------------------------------------------------------------------------------
+static BigTab   s_copiedBigTab;    // コピーした大タブ
+static SmallTab s_copiedSmallTab;  // コピーした小タブ
+static bool     s_hasCopiedBigTab   = false;  // 大タブがコピーされているか
+static bool     s_hasCopiedSmallTab = false;  // 小タブがコピーされているか
+
+static bool HasBigTabName(const std::wstring& name) {
+    for (const auto& tab : g_bigTabs) {
+        if (tab.name == name) return true;
+    }
+    return false;
+}
+
+static bool HasSmallTabName(const BigTab& bigTab, const std::wstring& name) {
+    for (const auto& tab : bigTab.smallTabs) {
+        if (tab.name == name) return true;
+    }
+    return false;
+}
+
+static std::wstring MakeUniqueCopiedBigTabName(const std::wstring& baseName) {
+    if (!HasBigTabName(baseName)) return baseName;
+
+    const std::wstring copiedName = baseName + L"のコピー";
+    if (!HasBigTabName(copiedName)) return copiedName;
+
+    for (int suffix = 2;; ++suffix) {
+        std::wstring candidate = copiedName + L" " + std::to_wstring(suffix);
+        if (!HasBigTabName(candidate)) return candidate;
+    }
+}
+
+static std::wstring MakeUniqueCopiedSmallTabName(const BigTab& bigTab, const std::wstring& baseName) {
+    if (!HasSmallTabName(bigTab, baseName)) return baseName;
+
+    const std::wstring copiedName = baseName + L"のコピー";
+    if (!HasSmallTabName(bigTab, copiedName)) return copiedName;
+
+    for (int suffix = 2;; ++suffix) {
+        std::wstring candidate = copiedName + L" " + std::to_wstring(suffix);
+        if (!HasSmallTabName(bigTab, candidate)) return candidate;
+    }
+}
+
+//------------------------------------------------------------------------------
 // カスタム多段レイアウト計算
 //  - ネイティブコントロールを単行のまま使い、描画/ヒットテスト/高さは自前で管理
 //  - TCS_MULTILINE の「選択行が下に移動」問題を回避する
@@ -122,6 +168,62 @@ static void MoveSmallTab(HWND hwnd, int from, int to) {
         TabCtrl_InsertItem(hwnd, i, &tci);
     }
     TabCtrl_SetCurSel(hwnd, bt.smallTabIdx);
+    NavigateExplorerToCurrentTab();
+    SaveState();
+}
+
+//------------------------------------------------------------------------------
+// タブコピーペースト用ヘルパー関数 [改善2]
+//------------------------------------------------------------------------------
+static void CopyBigTab(int idx) {
+    if (idx < 0 || idx >= (int)g_bigTabs.size()) return;
+    s_copiedBigTab = g_bigTabs[idx];
+    s_hasCopiedBigTab = true;
+    s_hasCopiedSmallTab = false;  // 大タブコピー時は小タブ情報をクリア
+}
+
+static void PasteBigTab(HWND hwnd) {
+    if (!s_hasCopiedBigTab) return;
+    BigTab newTab = s_copiedBigTab;
+    newTab.name = MakeUniqueCopiedBigTabName(newTab.name);
+    g_bigTabs.push_back(newTab);
+    g_bigTabIdx = (int)g_bigTabs.size() - 1;
+    
+    TCITEMW tci{}; tci.mask = TCIF_TEXT;
+    tci.pszText = const_cast<wchar_t*>(newTab.name.c_str());
+    TabCtrl_InsertItem(hwnd, g_bigTabIdx, &tci);
+    TabCtrl_SetCurSel(hwnd, g_bigTabIdx);
+    RebuildSmallTabs();
+    if (g_hwndRight) DoRightLayout(g_hwndRight);
+    NavigateExplorerToCurrentTab();
+    SaveState();
+}
+
+static void CopySmallTab(int idx) {
+    if (g_bigTabIdx < 0 || g_bigTabIdx >= (int)g_bigTabs.size()) return;
+    auto& bt = g_bigTabs[g_bigTabIdx];
+    if (idx < 0 || idx >= (int)bt.smallTabs.size()) return;
+    s_copiedSmallTab = bt.smallTabs[idx];
+    s_hasCopiedSmallTab = true;
+    s_hasCopiedBigTab = false;  // 小タブコピー時は大タブ情報をクリア
+}
+
+static void PasteSmallTab(HWND hwnd) {
+    if (g_bigTabIdx < 0 || g_bigTabIdx >= (int)g_bigTabs.size()) return;
+    if (!s_hasCopiedSmallTab) return;
+    
+    auto& bt = g_bigTabs[g_bigTabIdx];
+    SmallTab newTab = s_copiedSmallTab;
+    newTab.name = MakeUniqueCopiedSmallTabName(bt, newTab.name);
+    bt.smallTabs.push_back(newTab);
+    int newIdx = (int)bt.smallTabs.size() - 1;
+    
+    TCITEMW tci{}; tci.mask = TCIF_TEXT;
+    tci.pszText = const_cast<wchar_t*>(newTab.name.c_str());
+    TabCtrl_InsertItem(hwnd, newIdx, &tci);
+    bt.smallTabIdx = newIdx;
+    TabCtrl_SetCurSel(hwnd, newIdx);
+    if (g_hwndRight) DoRightLayout(g_hwndRight);
     NavigateExplorerToCurrentTab();
     SaveState();
 }
@@ -280,6 +382,11 @@ LRESULT CALLBACK BigTabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             AppendMenuW(hm, MF_STRING, 3002, L"名前変更");
             AppendMenuW(hm, MF_STRING, 3004, L"初期位置に移動");
             AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hm, MF_STRING, 3005, L"コピー");          // [改善2]
+            // ペースト（コピーがあれば有効、なければ無効）
+            UINT pasteFlags = s_hasCopiedBigTab ? MF_STRING : (MF_STRING | MF_GRAYED);
+            AppendMenuW(hm, pasteFlags, 3006, L"ペースト");
+            AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hm, MF_STRING, 3003, L"削除");
         }
         POINT spt; GetCursorPos(&spt);
@@ -310,6 +417,12 @@ LRESULT CALLBACK BigTabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                 InvalidateRect(hwnd, nullptr, FALSE);
                 SaveState();
             }
+
+        } else if (cmd == 3005 && hitIdx >= 0) {
+            CopyBigTab(hitIdx);  // [改善2]
+
+        } else if (cmd == 3006) {
+            PasteBigTab(hwnd);   // [改善2]
 
         } else if (cmd == 3004 && hitIdx >= 0) {
             // 選択タブに切り替えてからそのタブの初期位置に移動
@@ -452,6 +565,11 @@ LRESULT CALLBACK SmallTabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             AppendMenuW(hm, MF_STRING, 4004, L"現在の場所をパスに設定");
             AppendMenuW(hm, MF_STRING, 4006, L"初期位置に移動");
             AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hm, MF_STRING, 4007, L"コピー");          // [改善2]
+            // ペースト（コピーがあれば有効、なければ無効）
+            UINT pasteFlags2 = s_hasCopiedSmallTab ? MF_STRING : (MF_STRING | MF_GRAYED);
+            AppendMenuW(hm, pasteFlags2, 4008, L"ペースト");
+            AppendMenuW(hm, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hm, MF_STRING, 4005, L"削除");
         }
         POINT spt; GetCursorPos(&spt);
@@ -481,6 +599,12 @@ LRESULT CALLBACK SmallTabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                 InvalidateRect(hwnd, nullptr, FALSE);
                 SaveState();
             }
+
+        } else if (cmd == 4007 && hitIdx >= 0) {
+            CopySmallTab(hitIdx);  // [改善2]
+
+        } else if (cmd == 4008) {
+            PasteSmallTab(hwnd);   // [改善2]
 
         } else if (cmd == 4003 && hitIdx >= 0) {
             wchar_t disp[MAX_PATH]{};

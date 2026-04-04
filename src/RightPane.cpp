@@ -184,23 +184,86 @@ static void UpdateAddrBar() {
 //  - エイリアスデータは EDIT_SECTION::get_object_alias() で取得 (UTF-8 テキスト)
 //------------------------------------------------------------------------------
 
+static OBJECT_HANDLE GetAliasTargetObject(EDIT_SECTION* edit) {
+    if (!edit) return nullptr;
+
+    if (edit->get_selected_object_num && edit->get_selected_object) {
+        const int selectedCount = edit->get_selected_object_num();
+        if (selectedCount > 0) {
+            OBJECT_HANDLE selected = edit->get_selected_object(0);
+            if (selected) return selected;
+        }
+    }
+
+    return edit->get_focus_object ? edit->get_focus_object() : nullptr;
+}
+
+static std::wstring Utf8ToWide(const std::string& text) {
+    if (text.empty()) return {};
+
+    const int needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(),
+                                           static_cast<int>(text.size()), nullptr, 0);
+    if (needed <= 0) return {};
+
+    std::wstring result(needed, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                        result.data(), needed);
+    return result;
+}
+
+static std::wstring ExtractAliasDisplayName(const std::string& aliasBytes) {
+    if (aliasBytes.empty()) return {};
+
+    const std::wstring aliasText = Utf8ToWide(aliasBytes);
+    if (aliasText.empty()) return {};
+
+    const wchar_t* keys[] = { L"name=", L"effect.name=", L"file=" };
+    for (const auto* key : keys) {
+        size_t pos = aliasText.find(key);
+        if (pos == std::wstring::npos) continue;
+
+        pos += wcslen(key);
+        size_t end = aliasText.find_first_of(L"\r\n", pos);
+        std::wstring value = aliasText.substr(pos, end == std::wstring::npos ? std::wstring::npos : end - pos);
+        if (!value.empty()) return value;
+    }
+
+    return {};
+}
+
+static void SanitizeFileName(std::wstring& name) {
+    static constexpr wchar_t invalidChars[] = L"<>:\"/\\|?*";
+    for (auto& ch : name) {
+        if (wcschr(invalidChars, ch)) ch = L'_';
+    }
+
+    while (!name.empty() && (name.back() == L' ' || name.back() == L'.')) {
+        name.pop_back();
+    }
+}
+
 // call_edit_section_param のコールバックで使うキャプチャ構造体
 struct AliasCaptureData {
     std::string aliasBytes;   // get_object_alias の戻り値 (UTF-8)
-    std::wstring projectName; // プロジェクトファイル名 (拡張子なし, ダイアログデフォルト名用)
+    std::wstring objectName;  // オブジェクト名 (ダイアログデフォルト名用) [改善1]
+    std::wstring projectName; // プロジェクトファイル名 (拡張子なし, フォールバック用)
 };
 
 static void CaptureAliasCallback(void* param, EDIT_SECTION* edit) {
     if (!edit || !param) return;
     auto* cap = static_cast<AliasCaptureData*>(param);
 
-    OBJECT_HANDLE obj = edit->get_focus_object();
+    OBJECT_HANDLE obj = GetAliasTargetObject(edit);
     if (!obj) return;
 
     LPCSTR data = edit->get_object_alias(obj);
     if (data && data[0]) cap->aliasBytes = data;
 
-    // プロジェクト名を取得 (ファイル名のデフォルト用)
+    // オブジェクト名を取得 (ファイル名のデフォルト用) [改善1]
+    LPCWSTR objName = edit->get_object_name(obj);
+    if (objName && objName[0]) cap->objectName = objName;
+
+    // プロジェクト名を取得 (オブジェクト名がない場合のフォールバック用)
     if (g_editHandle) {
         PROJECT_FILE* pf = edit->get_project_file(g_editHandle);
         if (pf) {
@@ -228,8 +291,19 @@ static void CreateAliasForSelected() {
         return;
     }
 
-    // デフォルト保存名: <プロジェクト名>.object (なければ "alias.object")
-    std::wstring defaultName = cap.projectName.empty() ? L"alias" : cap.projectName;
+    // デフォルト保存名: <オブジェクト名>.object → <プロジェクト名>.object → "alias.object" [改善1]
+    std::wstring defaultName;
+    if (!cap.objectName.empty()) {
+        defaultName = cap.objectName;
+    } else if (std::wstring aliasName = ExtractAliasDisplayName(cap.aliasBytes); !aliasName.empty()) {
+        defaultName = aliasName;
+    } else if (!cap.projectName.empty()) {
+        defaultName = cap.projectName;
+    } else {
+        defaultName = L"alias";
+    }
+    SanitizeFileName(defaultName);
+    if (defaultName.empty()) defaultName = L"alias";
     defaultName += L".object";
 
     // 保存先ダイアログ (初期ディレクトリ = 現在のエクスプローラーフォルダ)
