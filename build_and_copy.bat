@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 chcp 65001 > nul
 setlocal
 cd /d "%~dp0"
@@ -10,7 +10,7 @@ set DEST=e:\important\aviutl2_latest\data\Plugin\MediaExplorerPlus.aux2
 echo ==========================================
 echo  Building...
 echo ==========================================
-cmake --build "%BUILD_DIR%" --config Release
+powershell -ExecutionPolicy Bypass -File "%~dp0scripts\build.ps1" -Configuration Release
 if errorlevel 1 (
     echo.
     echo [ERROR] Build failed
@@ -34,3 +34,4 @@ if errorlevel 1 (
 echo.
 echo Done.
 pause
+

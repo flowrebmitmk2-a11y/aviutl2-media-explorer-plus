@@ -15,9 +15,9 @@
 #include <vector>
 #include <algorithm>
 
-#include "sdk/plugin2.h"
-#include "sdk/logger2.h"
-#include "sdk/config2.h"
+#include <aviutl2_sdk/plugin2.h>
+#include <aviutl2_sdk/logger2.h>
+#include <aviutl2_sdk/config2.h>
 
 //------------------------------------------------------------------------------
 // データ構造
