@@ -1,13 +1,18 @@
 ﻿# MediaExplorerPlus
 
-`MediaExplorerPlus` は AviUtl2 用の `.aux2` プラグインです。メディア探索やオブジェクト配置まわりの作業を拡張する前提で、GitHub 公開と自動ビルドに対応しやすい形へ整理しています。
+`MediaExplorerPlus` は AviUtl2 用のプラグインです。素材フォルダをタブ付きで開き、メディア探索をしやすくします。
 
-## 主な内容
+## 導入方法
 
-- AviUtl2 向けのプラグイン本体
-- CMake ベースのビルド構成
-- GitHub Actions による自動ビルド
-- SDK サブモジュール前提の構成
+1. `MediaExplorerPlus.aux2` を AviUtl2 のプラグイン配置先へ置きます。
+2. 必要に応じて AviUtl2 を再起動します。
+
+## AviUtl2 上での簡単な使い方
+
+1. AviUtl2 で `Media Explorer Plus` のウィンドウを開きます。
+2. 上部の戻る、進む、上へボタンやアドレス欄を使ってフォルダを移動します。
+3. 大タブ、小タブを切り替えてよく使う場所をまとめます。
+4. 右側のボタンからコピー、貼り付け、alias 保存などを使います。
 
 ## ディレクトリ構成
 
@@ -48,6 +53,3 @@ cmake --build build --config Release
 - pull request
 - 手動実行
 - `repository_dispatch` の `sdk-updated`
-
-
-
